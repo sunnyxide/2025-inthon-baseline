@@ -13,6 +13,8 @@ from config import (
 )
 
 import os
+import re
+import math
 
 import torch
 
@@ -90,6 +92,87 @@ def _encode_rpn_text(tokenizer: CharTokenizer, text: str) -> List[int]:
         raise ValueError(
             f"RPN tokenizer missing chars {unknown_chars} for text '{text}'"
         ) from exc
+
+
+def _tokenize_infix_for_rpn(expr: str) -> List[str]:
+    """
+    Infix expression을 RPN stack value 계산용 토큰 리스트로 변환하기 위한 간단 토크나이저.
+    Developer log: 숫자/연산자/괄호 단위로 분리 (multi-digit 숫자 유지).
+    """
+    expr = expr.replace(" ", "")
+    return re.findall(r"\d+|//|[+\-*/()]", expr)
+
+
+def _infix_to_rpn_numbers(expr: str) -> List[str]:
+    """
+    숫자 토큰 수준의 RPN 시퀀스 생성 (stack value 계산용).
+    Developer log: 기존 char-level RPN과 동일한 연산자 순서를 보장.
+    """
+    tokens = _tokenize_infix_for_rpn(expr)
+    output: List[str] = []
+    stack: List[str] = []
+
+    def precedence(op: str) -> int:
+        if op in ("*", "//"):
+            return 2
+        if op in ("+", "-"):
+            return 1
+        return 0
+
+    for tok in tokens:
+        if tok.isdigit():
+            output.append(tok)
+        elif tok in {"+", "-", "*", "//"}:
+            while stack and stack[-1] not in "(" and precedence(stack[-1]) >= precedence(tok):
+                output.append(stack.pop())
+            stack.append(tok)
+        elif tok == "(":
+            stack.append(tok)
+        elif tok == ")":
+            while stack and stack[-1] != "(":
+                output.append(stack.pop())
+            if stack and stack[-1] == "(":
+                stack.pop()
+
+    while stack:
+        op = stack.pop()
+        if op != "(":
+            output.append(op)
+    return output
+
+
+def _compute_rpn_stack_values(expr: str) -> List[float]:
+    """
+    Infix 식에서 RPN 스택 중간 값(연산자 적용 직후 top 값)의 log-scale 리스트를 계산.
+    Developer log: scratchpad supervision용 label 생성 (train 전용).
+    음수 결과는 데이터 생성 단계에서 이미 필터링되므로 발생하지 않음.
+    """
+    rpn_tokens = _infix_to_rpn_numbers(expr)
+    stack: List[int] = []
+    values: List[float] = []
+    for tok in rpn_tokens:
+        if tok.isdigit():
+            stack.append(int(tok))
+        elif tok in {"+", "-", "*", "//"} and len(stack) >= 2:
+            b = stack.pop()
+            a = stack.pop()
+            if tok == "+":
+                res = a + b
+            elif tok == "-":
+                res = a - b  # 음수는 데이터 생성에서 이미 방지됨
+            elif tok == "*":
+                res = a * b
+            else:
+                if b == 0:
+                    # 방어적 처리: 0으로 나누기 발생 시 결과를 0으로 클램핑
+                    res = 0
+                else:
+                    res = a // b
+            stack.append(res)
+            # log-scale 값으로 변환하여 범위 안정화
+            values.append(math.log10(res + 1.0))
+        # 기타 토큰은 무시
+    return values
 
 
 def _pad_sequences(seqs: List[List[int]], pad_id: int) -> torch.Tensor:
@@ -185,7 +268,7 @@ sweep_config = {
     "parameters": {
         # Learning rate (증강 데이터 fine-tuning용으로 낮춤)
         "lr": {
-            "values": [1e-4, 2e-4, 5e-5],  # Fine-tuning: 기존보다 2-5배 낮춤
+            "values": [1.5e-4, 2e-4, 2.5e-4],  # Plan: 1.5e-4 ~ 2.5e-4 범위 탐색
         },
         
         # Model architecture (W&B sweep 최적값 중심으로 확장 탐색)
@@ -219,12 +302,20 @@ sweep_config = {
         
         # Batch size (W&B sweep 최적값: 128)
         "batch_size": {
-            "values": [64, 128, 256],  # 128이 최적값
+            "values": [128, 256],  # 128/256 두 가지 배치 크기만 탐색
         },
         
         # Data phase (W&B sweep 최적값: phase 2-3에 해당)
         "phase": {
             "values": [2, 3, 4],  # max_depth 2-3에 해당
+        },
+        # Depth profile sweep: baseline vs legacy_powerup vs deep_context
+        "depth_profile": {
+            "values": ["baseline", "legacy_powerup", "deep_context"],
+        },
+        # Developer log: max_train_steps sweep (90k 중심)
+        "max_train_steps": {
+            "values": [90_000, 120_000],
         },
     },
 }
@@ -272,27 +363,43 @@ def train_loop(
         weight_decay=train_config.weight_decay
     )
     
-    # Learning rate scheduler: warmup + cosine decay (리뷰 반영)
+    # Learning rate scheduler: warmup + cosine decay / optional plateau (리뷰 반영)
+    scheduler = None
+    scheduler_requires_metric = False  # ReduceLROnPlateau 여부 플래그
     if train_config.use_cosine_schedule:
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
         warmup_scheduler = LinearLR(
-            optim, 
-            start_factor=0.1, 
-            end_factor=1.0, 
-            total_iters=train_config.warmup_steps
+            optim,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=train_config.warmup_steps,
         )
         cosine_scheduler = CosineAnnealingLR(
             optim,
-            T_max=max(1, (train_config.max_train_steps or 100000) - train_config.warmup_steps),
-            eta_min=1e-6
+            T_max=max(
+                1,
+                (train_config.max_train_steps or 100000) - train_config.warmup_steps,
+            ),
+            eta_min=train_config.min_lr_threshold,
         )
         scheduler = SequentialLR(
             optim,
             schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[train_config.warmup_steps]
+            milestones=[train_config.warmup_steps],
         )
-    else:
-        scheduler = None
+    elif getattr(train_config, "use_plateau_schedule", False):
+        # Developer log: Validation EM 기반 ReduceLROnPlateau 스케줄러
+        from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+        scheduler = ReduceLROnPlateau(
+            optim,
+            mode="max",
+            factor=getattr(train_config, "plateau_factor", 0.5),
+            patience=getattr(train_config, "plateau_patience", 2),
+            min_lr=train_config.min_lr_threshold,
+            verbose=False,
+        )
+        scheduler_requires_metric = True
 
     # seq2seq에서 흔히 쓰는 CE loss
     # Developer log: Added label smoothing for better generalization
@@ -312,6 +419,9 @@ def train_loop(
         if use_rpn_head and rpn_tokenizer is not None
         else None
     )
+    # Developer log: RPN stack-value regression loss (scratchpad supervision)
+    use_rpn_value_head = use_rpn_head and getattr(train_config, "lambda_rpn_value", 0.0) > 0
+    loss_fn_rpn_value = nn.MSELoss(reduction="sum") if use_rpn_value_head else None
 
     step = 0
 
@@ -388,10 +498,13 @@ def train_loop(
             rpn_inp = rpn_out = None
             result_logits = None
             rpn_logits = None
+            rpn_value_pred = None
 
             if use_rpn_head and rpn_tokenizer is not None and loss_fn_rpn is not None:
                 rpn_inp_ids: List[List[int]] = []
                 rpn_out_ids: List[List[int]] = []
+                rpn_value_targets_list: List[List[float]] = []
+                rpn_value_masks_list: List[List[int]] = []
                 for idx, expr in enumerate(batch["input_text"]):
                     tokens = _safe_infix_to_rpn(expr)
                     rpn_text = " ".join(tokens)
@@ -417,8 +530,47 @@ def train_loop(
                     rpn_inp_ids.append([rpn_tokenizer.bos_id] + ids_body)
                     rpn_out_ids.append(ids_body + [rpn_tokenizer.eos_id])
 
+                    # RPN stack-value targets (연산자 위치 기준 log-scale 값)
+                    if use_rpn_value_head:
+                        stack_vals = _compute_rpn_stack_values(expr)
+                        value_seq: List[float] = []
+                        mask_seq: List[int] = []
+                        op_index = 0
+                        for tok in tokens:
+                            if tok in {"+", "-", "*", "D"}:
+                                if op_index < len(stack_vals):
+                                    value_seq.append(stack_vals[op_index])
+                                    mask_seq.append(1)
+                                    op_index += 1
+                                else:
+                                    # 방어적: label 부족 시 마스크만 0으로 설정
+                                    value_seq.append(0.0)
+                                    mask_seq.append(0)
+                            else:
+                                value_seq.append(0.0)
+                                mask_seq.append(0)
+                        rpn_value_targets_list.append(value_seq)
+                        rpn_value_masks_list.append(mask_seq)
+
                 rpn_inp = _pad_sequences(rpn_inp_ids, rpn_tokenizer.pad_id).to(device)
                 rpn_out = _pad_sequences(rpn_out_ids, rpn_tokenizer.pad_id).to(device)
+                rpn_value_targets = None
+                rpn_value_mask = None
+                if use_rpn_value_head and rpn_value_targets_list:
+                    max_len_val = max(len(v) for v in rpn_value_targets_list)
+                    B_val = len(rpn_value_targets_list)
+                    rpn_value_targets = torch.zeros(
+                        (B_val, max_len_val), dtype=torch.float32, device=device
+                    )
+                    rpn_value_mask = torch.zeros(
+                        (B_val, max_len_val), dtype=torch.float32, device=device
+                    )
+                    for bi, (vals, mask_seq) in enumerate(
+                        zip(rpn_value_targets_list, rpn_value_masks_list)
+                    ):
+                        L = len(vals)
+                        rpn_value_targets[bi, :L] = torch.tensor(vals, dtype=torch.float32, device=device)
+                        rpn_value_mask[bi, :L] = torch.tensor(mask_seq, dtype=torch.float32, device=device)
                 
                 # Additional safety check
                 if step == 0:
@@ -432,7 +584,7 @@ def train_loop(
                     if max_out_val >= rpn_tokenizer.vocab_size:
                         print(f"  ❌ ERROR: rpn_out has index {max_out_val} >= vocab size {rpn_tokenizer.vocab_size}")
 
-                result_logits, rpn_logits = model.forward_with_rpn(
+                result_logits, rpn_logits, rpn_value_pred = model.forward_with_rpn(
                     src=src,
                     tgt_result_inp=target_input,
                     src_pad_id=input_tokenizer.pad_id,
@@ -472,6 +624,30 @@ def train_loop(
             else:
                 loss_rpn = None
 
+            # RPN stack-value regression loss (scratchpad)
+            if (
+                use_rpn_value_head
+                and loss_fn_rpn_value is not None
+                and rpn_value_pred is not None
+                and rpn_value_targets is not None
+                and rpn_value_mask is not None
+            ):
+                # rpn_value_pred: [B, T_rpn], rpn_value_targets/mask: [B, T_rpn]
+                min_len = min(
+                    rpn_value_pred.size(1),
+                    rpn_value_targets.size(1),
+                )
+                pred_trim = rpn_value_pred[:, :min_len]
+                target_trim = rpn_value_targets[:, :min_len]
+                mask_trim = rpn_value_mask[:, :min_len]
+                diff_sq = (pred_trim - target_trim) ** 2
+                diff_sq = diff_sq * mask_trim
+                denom = mask_trim.sum().clamp_min(1.0)
+                loss_rpn_value = loss_fn_rpn_value(diff_sq) / denom
+                loss = loss + train_config.lambda_rpn_value * loss_rpn_value
+            else:
+                loss_rpn_value = None
+
             # --------------------------------------------------------------
 
             # 5) Backward + optimizer step
@@ -486,7 +662,7 @@ def train_loop(
             optim.step()
             
             # Learning rate scheduling (리뷰 반영)
-            if scheduler is not None:
+            if scheduler is not None and not scheduler_requires_metric:
                 scheduler.step()
 
             optim.zero_grad()
@@ -502,6 +678,8 @@ def train_loop(
             }
             if loss_rpn is not None:
                 log_payload["train/loss_rpn"] = loss_rpn.item()
+            if 'loss_rpn_value' in locals() and loss_rpn_value is not None:
+                log_payload["train/loss_rpn_value"] = float(loss_rpn_value.item())
             wandb.log(log_payload)
 
             # --------------------------------------------------------------
@@ -519,10 +697,11 @@ def train_loop(
                 with torch.no_grad():
 
                     preds_all: List[str] = []
-
+                    
                     targets_all: List[str] = []
-
+                    
                     inputs_all: List[str] = [] # 검증 데이터셋의 입력, 정답, 예측 결과를 저장할 리스트
+                    metas_all: List[dict] = []  # 카테고리/phase 등 메타 정보 수집용
 
                     for val_batch in val_dataloader: # 검증 데이터셋을 순회하며 각 배치에 대해 검증을 수행합니다.
 
@@ -572,11 +751,15 @@ def train_loop(
 
                             preds_all.append(pred_str)
 
-                        # 검증 데이터셋의 정답, 입력을 리스트에 추가합니다.
-
+                        # 검증 데이터셋의 정답, 입력, 메타를 리스트에 추가합니다.
+                        
                         targets_all.extend(val_batch["target_text"])
-
+                        
                         inputs_all.extend(val_batch["input_text"])
+                        if "meta" in val_batch:
+                            metas_all.extend(val_batch["meta"])
+                        else:
+                            metas_all.extend({} for _ in val_batch["input_text"])
 
                     # 검증 데이터셋의 예측, 정답을 사용하여 성능 지표를 계산합니다.
                     em_batch = compute_metrics(preds_all, targets_all)
@@ -590,6 +773,33 @@ def train_loop(
                             "step": step,
                         }
                     )
+
+                    # Category-wise EM/TES 로깅 (confusion-style 분석용)
+                    if metas_all:
+                        category_indices: dict[str, List[int]] = {}
+                        for idx, meta in enumerate(metas_all):
+                            cat = meta.get("category", "unknown")
+                            category_indices.setdefault(cat, []).append(idx)
+                        
+                        cat_log_payload: dict[str, float] = {}
+                        for cat, idxs in category_indices.items():
+                            if not idxs:
+                                continue
+                            cat_preds = [preds_all[i] for i in idxs]
+                            cat_targets = [targets_all[i] for i in idxs]
+                            cat_metrics = compute_metrics(cat_preds, cat_targets)
+                            cat_em = float(cat_metrics.get("EM", 0.0))
+                            cat_tes = float(cat_metrics.get("TES", 0.0))
+                            key_prefix = f"valid/{cat}"
+                            cat_log_payload[f"{key_prefix}/EM"] = cat_em
+                            cat_log_payload[f"{key_prefix}/TES"] = cat_tes
+                        if cat_log_payload:
+                            cat_log_payload["step"] = step
+                            wandb.log(cat_log_payload)
+
+                    # Plateau 스케줄러 사용 시 validation metric 기반으로 step 호출
+                    if scheduler is not None and scheduler_requires_metric:
+                        scheduler.step(current_em)
 
                     # 진행바에도 성능을 표시합니다.
                     pbar.write(f"[valid {step}] EM={em_batch['EM']:.3f} TES={em_batch['TES']:.3f} LR={current_lr:.2e}")
@@ -674,59 +884,93 @@ def train_loop(
                             torch.save(ckpt, train_config.save_best_path)
                             pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
 
-                    # 고정된 validation 샘플 표시 (원래 방식 유지 + 카테고리 라벨 추가)
-                    # Validation 데이터셋이 고정되어 있으므로, 항상 같은 인덱스의 샘플을 보여줌
-                    B = len(preds_all)  # 검증 데이터셋의 크기
-                    n_show = min(train_config.show_valid_samples, B)
-                    
+                    # Developer log: 카테고리별로 다양한 validation 샘플 10개 선택 (ec-focus 개선 반영)
                     pbar.write("=" * 80)
-                    pbar.write("Sample Validation Output (대회 평가 기준별):")
+                    pbar.write("Sample Validation Output (카테고리별 다양하게 10개):")
                     pbar.write("=" * 80)
                     
-                    for i in range(n_show):
-                        input_str = inputs_all[i]
-                        tgt = targets_all[i]
-                        pred = preds_all[i]
+                    # 카테고리별로 샘플 분류
+                    import re
+                    categorized_samples = {
+                        "division": [],      # 나눗셈
+                        "subtraction": [],   # 뺄셈
+                        "addition": [],      # 덧셈
+                        "multiplication": [], # 곱셈
+                        "mixed": [],         # 혼합연산
+                        "parentheses": [],   # 괄호
+                        "large_number": [],  # 큰 수 (5자리+)
+                        "identity": [],      # 항등원 (0, 1)
+                        "op3_plus": [],      # 연산자 3개 이상
+                    }
+                    
+                    for i, (inp, tgt, pred) in enumerate(zip(inputs_all, targets_all, preds_all)):
+                        # 카테고리 판별
+                        has_paren = "(" in inp
+                        has_div = "//" in inp
+                        has_sub = "-" in inp and not inp.startswith("-")
+                        has_add = "+" in inp
+                        has_mul = "*" in inp and not has_div
+                        result_large = len(tgt) >= 5
+                        
+                        # 연산자 개수
+                        op_count = inp.count('+') + inp.count('-') + inp.count('*') + inp.count('//')
+                        
+                        # 우선순위로 분류 (각 카테고리당 1개씩)
+                        if has_paren and len(categorized_samples["parentheses"]) < 1:
+                            categorized_samples["parentheses"].append((i, inp, tgt, pred, "괄호"))
+                        elif result_large and len(categorized_samples["large_number"]) < 1:
+                            categorized_samples["large_number"].append((i, inp, tgt, pred, "큰수(5+자리)"))
+                        elif ("+0" in inp or "0+" in inp or "*1" in inp or "1*" in inp) and len(categorized_samples["identity"]) < 1:
+                            categorized_samples["identity"].append((i, inp, tgt, pred, "항등원"))
+                        elif op_count >= 3 and len(categorized_samples["op3_plus"]) < 1:
+                            categorized_samples["op3_plus"].append((i, inp, tgt, pred, "연산자3+"))
+                        elif has_div and len(categorized_samples["division"]) < 1:
+                            categorized_samples["division"].append((i, inp, tgt, pred, "나눗셈"))
+                        elif has_sub and not has_add and not has_mul and len(categorized_samples["subtraction"]) < 1:
+                            categorized_samples["subtraction"].append((i, inp, tgt, pred, "뺄셈"))
+                        elif has_add and not has_sub and not has_mul and not has_div and len(categorized_samples["addition"]) < 1:
+                            categorized_samples["addition"].append((i, inp, tgt, pred, "덧셈"))
+                        elif has_mul and not has_add and not has_sub and not has_div and len(categorized_samples["multiplication"]) < 1:
+                            categorized_samples["multiplication"].append((i, inp, tgt, pred, "곱셈"))
+                        elif op_count > 1 and len(categorized_samples["mixed"]) < 1:
+                            categorized_samples["mixed"].append((i, inp, tgt, pred, "혼합"))
+                    
+                    # 10개 샘플 선택 (각 카테고리에서 1개씩)
+                    priority_categories = [
+                        "parentheses", "op3_plus", "large_number", "mixed",
+                        "identity", "division", "subtraction", "multiplication",
+                        "addition",
+                    ]
+                    
+                    selected_samples = []
+                    for cat in priority_categories:
+                        if categorized_samples[cat]:
+                            selected_samples.append(categorized_samples[cat][0])
+                        if len(selected_samples) >= train_config.show_valid_samples:
+                            break
+                    
+                    # 부족하면 앞에서 채우기
+                    if len(selected_samples) < train_config.show_valid_samples:
+                        for i in range(min(train_config.show_valid_samples, len(inputs_all))):
+                            if not any(s[0] == i for s in selected_samples):
+                                selected_samples.append((i, inputs_all[i], targets_all[i], preds_all[i], "기타"))
+                            if len(selected_samples) >= train_config.show_valid_samples:
+                                break
+                    
+                    # 출력
+                    for idx, (orig_idx, inp, tgt, pred, label) in enumerate(selected_samples):
                         ok = "✓" if pred == tgt else "✗"
                         
-                        # 카테고리 라벨 + 자리수 정보 추가
-                        import re
-                        category_label = ""
+                        # 자리수 정보
+                        numbers = re.findall(r'\d+', inp)
                         digit_info = ""
-                        
-                        # 입력 수식에서 숫자 추출 및 자리수 분석
-                        numbers = re.findall(r'\d+', input_str)
                         if numbers:
                             max_digits = max(len(n) for n in numbers)
                             num_count = len(numbers)
                             digit_info = f"{num_count}n{max_digits}d"
                         
-                        # 상세 카테고리 분류
-                        if "(" in input_str and "*" in input_str and ("+" in input_str or "-" in input_str):
-                            category_label = "[Mix:Paren*±]"  # 괄호+혼합
-                        elif "(" in input_str:
-                            category_label = "[Parentheses]"
-                        elif "//" in input_str:
-                            category_label = "[Division]"
-                        elif "-" in input_str and "+" not in input_str and "*" not in input_str:
-                            category_label = "[Subtraction]"
-                        elif any(pattern in input_str for pattern in ["+0", "*1", "+1", "*0", "0+", "1*"]):
-                            category_label = "[Identity]"
-                        elif len(tgt) >= 6:
-                            category_label = "[OOD:6+dig]"
-                        elif "*" in input_str and "+" not in input_str and "-" not in input_str:
-                            category_label = "[Multiply]"
-                        elif "+" in input_str and "*" not in input_str and "-" not in input_str:
-                            category_label = "[Addition]"
-                        elif "*" in input_str and "+" in input_str:
-                            category_label = "[Mix:*+]"
-                        elif "*" in input_str and "-" in input_str:
-                            category_label = "[Mix:*-]"
-                        else:
-                            category_label = "[Basic]"
-                        
-                        pbar.write(f"  [{i:2d}] {ok} {category_label:16s} {digit_info:7s} | "
-                                 f"in: {input_str:28s} | tgt: {tgt:9s} | pred: {pred:9s}")
+                        pbar.write(f"  [{idx:2d}] {ok} [{label:15s}] {digit_info:7s} | "
+                                 f"in: {inp:28s} | tgt: {tgt:9s} | pred: {pred:9s}")
                     
                     pbar.write("=" * 80)
 
@@ -1187,7 +1431,7 @@ def train_run():
             phase_mix = (2, 3, 4)
 
         train_config = TrainConfig(
-            max_train_steps=None,
+            max_train_steps=cfg.get("max_train_steps", None),
             lr=cfg.lr,
             warmup_steps=5000,
             weight_decay=0.1,

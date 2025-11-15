@@ -26,11 +26,11 @@ OPERATOR_COUNT_DISTRIBUTION = {
 }
 
 TRAINING_DISTRIBUTION = {
-    "base_calculation": 0.20,        # Calculation Accuracy (기본 계산)
-    "precedence": 0.15,              # Calculation Accuracy (연산 우선순위)
+    "base_calculation": 0.14,        # Calculation Accuracy (기본 계산)
+    "precedence": 0.18,              # Calculation Accuracy (연산 우선순위/괄호)
     "law_preservation": 0.18,        # Law Preservation (교환/결합 법칙)
     "expression_consistency": 0.20,  # Expression Consistency (표현 일관성)
-    "relational": 0.07,              # Relational Consistency (관계성)
+    "relational": 0.10,              # Relational Consistency (관계성/항등원)
     "long_expression": 0.10,         # 긴 수식/연속 연산 집중
     "complex_nested": 0.10,          # 복잡 중첩/괄호 패턴
 }
@@ -43,11 +43,11 @@ PHASE_DIGIT_DISTRIBUTION = {
 }
 
 OUTPUT_6DIGIT_RATIO = {
-    "base_calculation": 0.08,        # 기본 계산에서 큰 출력
-    "precedence": 0.12,              # 연산 우선순위에서 큰 출력
-    "law_preservation": 0.15,        # 법칙 보존에서 큰 출력
-    "expression_consistency": 0.20,  # 표현 일관성에서 큰 출력
-    "relational": 0.25,              # 관계성에서 큰 출력
+    "base_calculation": 0.05,        # 기본 계산에서 큰 출력
+    "precedence": 0.18,              # 연산 우선순위에서 큰 출력
+    "law_preservation": 0.20,        # 법칙 보존에서 큰 출력
+    "expression_consistency": 0.25,  # 표현 일관성에서 큰 출력
+    "relational": 0.30,              # 관계성에서 큰 출력
 }
 
 PHASE_AUGMENTATION_PROB = {
@@ -1227,12 +1227,27 @@ def create_augmented_dataset_from_original(original_dataset: Dataset) -> List[Di
             "meta": original_item.get("meta", {}).copy(),
         }
         original_with_group["meta"]["augmented"] = False
+        # Developer log: EC 학습을 위해 meta에도 group_id 저장
+        original_with_group["meta"]["group_id"] = group_id
         augmented_data.append(original_with_group)
         
         # Generate augmentations
+        # Developer log: 괄호/법칙/관계성 카테고리는 더 많은 동치 수식 쌍을 생성
+        meta = original_item.get("meta", {})
+        cat = meta.get("category", "")
+        if cat in {
+            "precedence",
+            "law_preservation",
+            "expression_consistency",
+            "relational",
+            "complex_nested",
+        }:
+            max_augs = 7
+        else:
+            max_augs = 5
         augmented_exprs = augment_with_mathematical_laws(
             expr,
-            max_augmentations=5,
+            max_augmentations=max_augs,
             max_depth=None,
             allow_zero_change=False,
         )

@@ -441,10 +441,12 @@ class TransformerSeq2Seq(nn.Module):
         dim_feedforward = kwargs.get("dim_feedforward", 512)
         dropout = kwargs.get("dropout", 0.1)
         rpn_vocab = kwargs.get("rpn_vocab")
+        use_digit_conv = kwargs.get("use_digit_conv", False)
         self.d_model = d_model
         self.in_vocab = in_vocab
         self.out_vocab = out_vocab
         self.rpn_vocab = rpn_vocab
+        self.use_digit_conv = use_digit_conv
 
         # 임베딩
         self.embed_in = nn.Embedding(in_vocab, d_model)
@@ -476,6 +478,15 @@ class TransformerSeq2Seq(nn.Module):
         # 출력 projection
         self.out_proj = nn.Linear(d_model, out_vocab)
 
+        # Digit-level 1D convolution module (선택적 자리올림 패턴 보강용)
+        if self.use_digit_conv:
+            # Developer log: 1D conv over decoder time dimension for carry modeling
+            self.digit_conv = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
+            self.digit_conv_activation = nn.ReLU()
+        else:
+            self.digit_conv = None
+            self.digit_conv_activation = None
+
         # RPN auxiliary decoder/projection (훈련 전용, optional)
         if rpn_vocab is not None:
             rpn_decoder_layer = nn.TransformerDecoderLayer(
@@ -488,10 +499,13 @@ class TransformerSeq2Seq(nn.Module):
             self.rpn_decoder = nn.TransformerDecoder(rpn_decoder_layer, num_layers=num_decoder_layers)
             self.rpn_embed = nn.Embedding(rpn_vocab, d_model)
             self.rpn_out = nn.Linear(d_model, rpn_vocab)
+            # Developer log: RPN stack-value regression head (scratchpad supervision)
+            self.rpn_value_out = nn.Linear(d_model, 1)
         else:
             self.rpn_decoder = None
             self.rpn_embed = None
             self.rpn_out = None
+            self.rpn_value_out = None
 
     def forward(
         self,
@@ -536,6 +550,13 @@ class TransformerSeq2Seq(nn.Module):
             memory_key_padding_mask=src_key_padding_mask,
         )  # [B, T, d_model]
 
+        # 선택적 digit-level 1D conv로 자리올림/자리수 상호작용 보강
+        if self.use_digit_conv and self.digit_conv is not None:
+            conv_in = dec_out.transpose(1, 2)  # [B, C, T]
+            conv_out = self.digit_conv(conv_in)
+            conv_out = self.digit_conv_activation(conv_out)
+            dec_out = conv_out.transpose(1, 2)  # [B, T, C]
+
         logits = self.out_proj(dec_out)  # [B, T, out_vocab]
         return logits
 
@@ -545,7 +566,7 @@ class TransformerSeq2Seq(nn.Module):
         tgt_result_inp: torch.Tensor,
         src_pad_id: int,
         rpn_inp: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         학습 시 결과/보조(RPN) 디코더를 동시에 실행.
         Returns:
@@ -578,6 +599,11 @@ class TransformerSeq2Seq(nn.Module):
             tgt_mask=res_mask,
             memory_key_padding_mask=src_key_padding_mask,
         )
+        if self.use_digit_conv and self.digit_conv is not None:
+            conv_in_res = res_out.transpose(1, 2)
+            conv_out_res = self.digit_conv(conv_in_res)
+            conv_out_res = self.digit_conv_activation(conv_out_res)
+            res_out = conv_out_res.transpose(1, 2)
         result_logits = self.out_proj(res_out)
 
         # --- RPN decoder (훈련 전용) ---
@@ -591,8 +617,12 @@ class TransformerSeq2Seq(nn.Module):
             memory_key_padding_mask=src_key_padding_mask,
         )
         rpn_logits = self.rpn_out(rpn_out)
+        rpn_value = None
+        if self.rpn_value_out is not None:
+            # [B, T_rpn]
+            rpn_value = self.rpn_value_out(rpn_out).squeeze(-1)
 
-        return result_logits, rpn_logits
+        return result_logits, rpn_logits, rpn_value
 
     @torch.no_grad()
     def generate(
@@ -636,6 +666,13 @@ class TransformerSeq2Seq(nn.Module):
                 tgt_mask=tgt_mask,
                 memory_key_padding_mask=src_key_padding_mask,
             )  # [B, T, d_model]
+
+            # Digit-level conv (optional)
+            if self.use_digit_conv and self.digit_conv is not None:
+                conv_in = dec_out.transpose(1, 2)  # [B, C, T]
+                conv_out = self.digit_conv(conv_in)
+                conv_out = self.digit_conv_activation(conv_out)
+                dec_out = conv_out.transpose(1, 2)
 
             last_step = dec_out[:, -1, :]        # [B, d_model]
             logits = self.out_proj(last_step)    # [B, out_vocab]
@@ -724,6 +761,12 @@ class TransformerSeq2Seq(nn.Module):
                         tgt_mask=tgt_mask,
                         memory_key_padding_mask=src_mask_b,
                     )  # [1, T, d_model]
+                    
+                    if self.use_digit_conv and self.digit_conv is not None:
+                        conv_in = dec_out.transpose(1, 2)  # [1, C, T]
+                        conv_out = self.digit_conv(conv_in)
+                        conv_out = self.digit_conv_activation(conv_out)
+                        dec_out = conv_out.transpose(1, 2)
                     
                     last_step = dec_out[:, -1, :]  # [1, d_model]
                     logits = self.out_proj(last_step)  # [1, out_vocab]
