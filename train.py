@@ -18,7 +18,7 @@ import torch
 
 import torch.nn as nn
 
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, Dataset
 
 from tqdm import tqdm
 
@@ -27,6 +27,7 @@ import wandb
 from dataloader import (
     ArithmeticDataset,  # 사칙연산 데이터를 만들어주는 Dataset
     get_dataloader,     # Dataset을 받아서 DataLoader로 바꿔주는 함수
+    create_augmented_dataset_from_original,  # 증강 데이터셋 생성 함수
 )
 
 from do_not_edit.metric import compute_metrics  # EM, TES 같은 간단한 성능 지표
@@ -294,10 +295,13 @@ def train_loop(
         scheduler = None
 
     # seq2seq에서 흔히 쓰는 CE loss
-
+    # Developer log: Added label smoothing for better generalization
     # pad 토큰은 무시하도록(ignore_index) 설정
 
-    loss_fn = nn.CrossEntropyLoss(ignore_index=output_tokenizer.pad_id)
+    loss_fn = nn.CrossEntropyLoss(
+        ignore_index=output_tokenizer.pad_id,
+        label_smoothing=0.1  # Label smoothing for regularization
+    )
     use_rpn_head = (
         rpn_tokenizer is not None
         and hasattr(model, "forward_with_rpn")
@@ -887,15 +891,49 @@ def main():
     # 1-2) 데이터 준비 (Train / Validation)
     #
     # --------------------------------------------------------------------------
-
-    train_dataset = ArithmeticDataset(
-        num_samples=train_config.train_num_samples,
+    
+    # Developer log: EC enhanced data generation strategy
+    # 1) Base 데이터 (40만개) - 연산자 1-4개 고르게 분포
+    print("=" * 70)
+    print("📊 Generating Base Dataset (400k samples)")
+    print("=" * 70)
+    
+    base_dataset = ArithmeticDataset(
+        num_samples=400_000,
         phase=train_config.train_phase_mix[0],
         phase_mix=train_config.train_phase_mix,
         seed=123,
         mode="train",
-        enable_augmentation=True,
+        enable_augmentation=False,  # 원본만 생성
     )
+    
+    # 2) 증강 데이터 생성 (40만 → 60만개)
+    # Developer log: Expression pairs with group_id for EC learning
+    print("\n" + "=" * 70)
+    print("🔄 Generating Augmented Dataset (40k → 60k with expression pairs)")
+    print("=" * 70)
+    
+    augmented_data_list = create_augmented_dataset_from_original(base_dataset)
+    
+    # 3) Augmented dataset을 Dataset으로 wrapping
+    class AugmentedDatasetWrapper(Dataset):
+        """Wrapper for augmented data list with group_id support."""
+        def __init__(self, data_list):
+            self.data = data_list
+            self.mode = "train"
+        
+        def __len__(self):
+            return len(self.data)
+        
+        def __getitem__(self, idx):
+            return self.data[idx]
+    
+    train_dataset = AugmentedDatasetWrapper(augmented_data_list)
+    
+    print(f"\n✅ Final training dataset: {len(train_dataset)} samples")
+    print(f"   - Original: ~400k samples")
+    print(f"   - Augmented: ~{len(train_dataset) - 400_000} samples")
+    print(f"   - Total: {len(train_dataset)} samples with group_id for EC\n")
 
     train_dataloader = get_dataloader(
         train_dataset,
@@ -1193,14 +1231,30 @@ def train_run():
             base_model_config = ModelConfig()
             model_config = apply_depth_profile(base_model_config, train_config.depth_profile)
 
-        train_dataset = ArithmeticDataset(
-            num_samples=train_config.train_num_samples,
+        # Developer log: EC enhanced data generation (same as main)
+        base_dataset = ArithmeticDataset(
+            num_samples=400_000,
             phase=train_config.train_phase_mix[0],
             phase_mix=train_config.train_phase_mix,
             seed=123,
             mode="train",
-            enable_augmentation=True,
+            enable_augmentation=False,
         )
+        
+        augmented_data_list = create_augmented_dataset_from_original(base_dataset)
+        
+        class AugmentedDatasetWrapper(Dataset):
+            def __init__(self, data_list):
+                self.data = data_list
+                self.mode = "train"
+            
+            def __len__(self):
+                return len(self.data)
+            
+            def __getitem__(self, idx):
+                return self.data[idx]
+        
+        train_dataset = AugmentedDatasetWrapper(augmented_data_list)
 
         train_dataloader = get_dataloader(
             train_dataset,

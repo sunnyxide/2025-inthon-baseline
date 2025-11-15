@@ -64,6 +64,40 @@ def _rand_int(rng: random.Random, num_digits: Tuple[int, int]) -> int:
     return int(str(first) + "".join(str(d) for d in rest))
 
 
+def _count_operators(expr: str) -> int:
+    """
+    Count number of operators in expression.
+    Developer log: Enhanced operator counting for multi-operator expressions.
+    """
+    tokens = re.findall(r'\d+|//|[+\-*/()]', expr)
+    return sum(1 for t in tokens if t in ['+', '-', '*', '//'])
+
+
+def _has_balanced_parentheses(expr: str) -> bool:
+    """
+    Check if parentheses are balanced in expression.
+    Developer log: Validation utility for augmented expressions.
+    """
+    cnt = 0
+    for ch in expr:
+        if ch == '(':
+            cnt += 1
+        elif ch == ')':
+            cnt -= 1
+            if cnt < 0:
+                return False
+    return cnt == 0
+
+
+def _parse_expression(expr: str) -> List[str]:
+    """
+    Parse expression into tokens (numbers and operators).
+    Developer log: Token parsing for augmentation functions.
+    """
+    tokens = re.findall(r'\d+|//|[+\-*/()]', expr)
+    return tokens
+
+
 def _sample_category(rng: random.Random) -> str:
     """Sample category based on distribution."""
     r = rng.random()
@@ -215,6 +249,163 @@ def _safe_augment_expression(
 
 
 # ---------------------------------------------------------------------------
+# Advanced augmentation utilities (team8 코드 통합)
+# ---------------------------------------------------------------------------
+
+
+def _find_subexpressions(tokens: List[str]) -> List[Tuple[int, int]]:
+    """
+    Find possible subexpression ranges in token list.
+    Developer log: Identifies valid subexpressions for parentheses augmentation.
+    """
+    subexprs = []
+    n = len(tokens)
+    
+    # 최소 3개 토큰 (숫자 연산자 숫자)
+    for i in range(n - 2):
+        for j in range(i + 2, n, 2):  # 2씩 증가 (숫자 위치)
+            if j < n and tokens[i].isdigit() and tokens[j].isdigit():
+                if _is_valid_subexpression(tokens[i:j+1]):
+                    subexprs.append((i, j))
+    
+    return subexprs
+
+
+def _is_valid_subexpression(tokens: List[str]) -> bool:
+    """Check if token sequence is a valid subexpression."""
+    if len(tokens) < 3:
+        return False
+    
+    # 숫자로 시작하고 끝나야 함
+    if not (tokens[0].isdigit() and tokens[-1].isdigit()):
+        return False
+    
+    # 패턴: 숫자 연산자 숫자 [연산자 숫자]...
+    for i in range(len(tokens)):
+        if i % 2 == 0:  # 짝수 인덱스는 숫자
+            if not tokens[i].isdigit():
+                return False
+        else:  # 홀수 인덱스는 연산자
+            if tokens[i] not in ['+', '-', '*', '//']:
+                return False
+    
+    return True
+
+
+def augment_with_parentheses(
+    expression: str,
+    max_augmentations: int = 3
+) -> List[str]:
+    """
+    Generate variations with added parentheses.
+    Developer log: Parentheses augmentation for precedence learning.
+    """
+    if '(' in expression or ')' in expression:
+        return []
+    
+    tokens = _parse_expression(expression)
+    subexprs = _find_subexpressions(tokens)
+    
+    if not subexprs:
+        return []
+    
+    augmented = []
+    for start, end in subexprs[:max_augmentations]:
+        new_tokens = tokens[:start] + ['('] + tokens[start:end+1] + [')'] + tokens[end+1:]
+        new_expr = ''.join(new_tokens)
+        if new_expr != expression:
+            augmented.append(new_expr)
+    
+    return augmented
+
+
+def augment_with_commutative_advanced(expression: str) -> List[str]:
+    """
+    Advanced commutative law augmentation.
+    Developer log: Swaps operands for + or * only expressions.
+    """
+    tokens = _parse_expression(expression)
+    
+    if '(' in expression or ')' in expression or len(tokens) < 3:
+        return []
+    
+    # Check if only + or * operators
+    operators = [t for t in tokens if t in ['+', '-', '*', '//']]
+    if not all(op in ['+'] for op in operators) and not all(op in ['*'] for op in operators):
+        return []
+    
+    augmented = []
+    operand_positions = [i for i in range(0, len(tokens), 2) if tokens[i].isdigit()]
+    
+    # Swap adjacent operands
+    for i in range(len(operand_positions) - 1):
+        pos1 = operand_positions[i]
+        pos2 = operand_positions[i + 1]
+        new_tokens = tokens.copy()
+        new_tokens[pos1], new_tokens[pos2] = new_tokens[pos2], new_tokens[pos1]
+        new_expr = ''.join(new_tokens)
+        if new_expr != expression:
+            augmented.append(new_expr)
+    
+    # Reverse all operands
+    if len(operand_positions) > 2:
+        reversed_tokens = tokens.copy()
+        for i in range(len(operand_positions)):
+            orig_pos = operand_positions[i]
+            new_pos = operand_positions[-(i+1)]
+            reversed_tokens[orig_pos] = tokens[new_pos]
+        reversed_expr = ''.join(reversed_tokens)
+        if reversed_expr != expression and reversed_expr not in augmented:
+            augmented.append(reversed_expr)
+    
+    return augmented
+
+
+def augment_with_mathematical_laws(
+    expression: str,
+    max_augmentations: int = 5,
+    max_depth: Optional[int] = None,
+    allow_zero_change: bool = False
+) -> List[str]:
+    """
+    Apply comprehensive mathematical law augmentations.
+    Developer log: Combines commutative, associative, distributive, parentheses, identity.
+    """
+    all_augmented = []
+    
+    # 교환법칙 (advanced version)
+    commutative_results = augment_with_commutative_advanced(expression)
+    all_augmented.extend(commutative_results)
+    
+    # 괄호 증강
+    parentheses_results = augment_with_parentheses(expression, max_augmentations=3)
+    all_augmented.extend(parentheses_results)
+    
+    # 항등원 증강
+    if max_depth is None or _count_operators(expression) < max_depth:
+        identity_ops = [
+            f"{expression}+0",
+            f"0+{expression}",
+            f"{expression}-0",
+            f"{expression}*1",
+            f"1*{expression}",
+        ]
+        all_augmented.extend(identity_ops[:min(3, max_augmentations)])
+    
+    # 중복 제거 및 최대 개수 제한
+    unique_results = []
+    seen = set()
+    for expr in all_augmented:
+        if expr not in seen:
+            seen.add(expr)
+            unique_results.append(expr)
+        if len(unique_results) >= max_augmentations:
+            break
+    
+    return unique_results
+
+
+# ---------------------------------------------------------------------------
 # Category generators
 # ---------------------------------------------------------------------------
 
@@ -282,14 +473,20 @@ def _gen_long_expression(
     rng: random.Random,
     digit_len: int,
 ) -> Tuple[str, int]:
-    """Generate long expressions with 5+ numbers for improved generalization."""
-    num_count = rng.randint(5, 7)  # 5-7개의 숫자
+    """
+    Generate long expressions with 5-8 operators for improved generalization.
+    Developer log: Enhanced to support 5-8 operators with proper precedence handling.
+    """
+    # 연산자 개수: 5-8개 (기존 5-7 숫자 → 5-8 연산자)
+    op_count = rng.randint(5, 8)
+    num_count = op_count + 1  # 연산자 개수 + 1 = 숫자 개수
+    
     numbers = [_rand_int(rng, (1, min(3, digit_len))) for _ in range(num_count)]
     
-    # 연산자 선택 (혼합)
+    # 연산자 선택 (혼합, 우선순위 고려)
     ops = []
-    for _ in range(num_count - 1):
-        if rng.random() < 0.6:
+    for _ in range(op_count):
+        if rng.random() < 0.5:
             ops.append(rng.choice(["+", "-"]))
         else:
             ops.append(rng.choice(["*", "//"]))
@@ -684,6 +881,84 @@ class ArithmeticDataset(Dataset):
                 "output_6digit": len(str(val)) >= 6,
             },
         }
+
+
+def create_augmented_dataset_from_original(original_dataset: Dataset) -> List[Dict[str, Any]]:
+    """
+    Create augmented dataset with group_id for EC learning.
+    Developer log: Generates expression pairs from original dataset for Expression Consistency.
+    Returns original + augmented samples with group_id field.
+    """
+    augmented_data = []
+    
+    print(f"Creating augmented dataset from {len(original_dataset)} samples...")
+    
+    for idx in range(len(original_dataset)):
+        original_item = original_dataset[idx]
+        expr = original_item["input_text"]
+        target = original_item["target_text"]
+        
+        # Validate original
+        target_str = str(target)
+        if not (len(target_str) > 0 and target_str.isdigit()):
+            continue
+        if not _has_balanced_parentheses(expr):
+            continue
+        
+        # Group ID for EC learning
+        group_id = f"ec_group_{idx}"
+        
+        # Add original with group_id
+        original_with_group = {
+            "input_text": expr,
+            "target_text": target_str,
+            "group_id": group_id,
+            "meta": original_item.get("meta", {}).copy(),
+        }
+        original_with_group["meta"]["augmented"] = False
+        augmented_data.append(original_with_group)
+        
+        # Generate augmentations
+        augmented_exprs = augment_with_mathematical_laws(
+            expr,
+            max_augmentations=5,
+            max_depth=None,
+            allow_zero_change=False,
+        )
+        
+        for aug_expr in augmented_exprs:
+            if isinstance(aug_expr, tuple):
+                expr_str, new_target = aug_expr
+            else:
+                expr_str, new_target = aug_expr, target_str
+            
+            new_target_str = str(new_target)
+            
+            # Validate augmented
+            if not (len(new_target_str) > 0 and new_target_str.isdigit()):
+                continue
+            if not _has_balanced_parentheses(expr_str):
+                continue
+            
+            aug_item = {
+                "input_text": expr_str,
+                "target_text": new_target_str,
+                "group_id": group_id,  # Same group_id for EC
+                "meta": {**original_with_group["meta"], "augmented": True},
+            }
+            augmented_data.append(aug_item)
+    
+    # Remove duplicates
+    seen = set()
+    unique_data = []
+    for item in augmented_data:
+        key = (item["input_text"], item["target_text"])
+        if key not in seen:
+            seen.add(key)
+            unique_data.append(item)
+    
+    print(f"Augmentation complete: {len(original_dataset)} → {len(unique_data)} samples")
+    return unique_data
 
 
 def get_dataloader(

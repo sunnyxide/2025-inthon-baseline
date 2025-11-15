@@ -656,6 +656,115 @@ class TransformerSeq2Seq(nn.Module):
             return torch.stack(outputs, dim=1)  # [B, gen_len]
         return torch.empty((B, 0), dtype=torch.long, device=device)
 
+    @torch.no_grad()
+    def generate_with_beam_search(
+        self,
+        src: torch.Tensor,   # [B, S]
+        max_len: int,
+        bos_id: int,
+        eos_id: int,
+        src_pad_id: int,
+        beam_size: int = 5,
+        length_penalty: float = 0.6,
+    ) -> torch.Tensor:
+        """
+        Beam Search decoding for better sequence generation.
+        Developer log: Implements beam search with length penalty for improved accuracy.
+        
+        Args:
+            src: [B, S] input sequence
+            beam_size: number of beams to maintain
+            length_penalty: penalty for longer sequences (higher = prefer longer)
+        
+        Returns:
+            [B, T'] generated sequence (best beam)
+        """
+        device = src.device
+        B, S = src.size()
+        
+        # --- Encoder (shared across all beams) ---
+        src_emb = self.embed_in(src) * math.sqrt(self.d_model)
+        src_emb = self.pos_enc_in(src_emb)
+        src_key_padding_mask = (src == src_pad_id)
+        memory = self.encoder(
+            src_emb,
+            src_key_padding_mask=src_key_padding_mask,
+        )  # [B, S, d_model]
+        
+        # For simplicity, process batch_size=1 at a time
+        # (Full batched beam search is complex; this is a practical implementation)
+        all_results = []
+        
+        for b in range(B):
+            # Single sample beam search
+            memory_b = memory[b:b+1]  # [1, S, d_model]
+            src_mask_b = src_key_padding_mask[b:b+1]  # [1, S]
+            
+            # Initialize beams: [(sequence, score)]
+            beams = [(torch.tensor([[bos_id]], device=device, dtype=torch.long), 0.0)]
+            
+            for step in range(max_len):
+                candidates = []
+                
+                for seq, score in beams:
+                    # If sequence ended with EOS, keep it as is
+                    if seq[0, -1].item() == eos_id:
+                        candidates.append((seq, score))
+                        continue
+                    
+                    # Decode one step
+                    T = seq.size(1)
+                    tgt_emb = self.embed_out(seq) * math.sqrt(self.d_model)  # [1, T, d_model]
+                    tgt_emb = self.pos_enc_out(tgt_emb)
+                    tgt_mask = _generate_square_subsequent_mask(T, device=device)
+                    
+                    dec_out = self.decoder(
+                        tgt_emb,
+                        memory_b,
+                        tgt_mask=tgt_mask,
+                        memory_key_padding_mask=src_mask_b,
+                    )  # [1, T, d_model]
+                    
+                    last_step = dec_out[:, -1, :]  # [1, d_model]
+                    logits = self.out_proj(last_step)  # [1, out_vocab]
+                    log_probs = torch.log_softmax(logits, dim=-1)  # [1, out_vocab]
+                    
+                    # Get top-k candidates
+                    top_log_probs, top_indices = torch.topk(log_probs[0], beam_size)
+                    
+                    for log_prob, idx in zip(top_log_probs, top_indices):
+                        new_seq = torch.cat([seq, idx.unsqueeze(0).unsqueeze(0)], dim=1)
+                        # Score with length penalty
+                        new_score = score + log_prob.item()
+                        candidates.append((new_seq, new_score))
+                
+                # Select top beam_size candidates
+                # Apply length penalty: score / (length ** length_penalty)
+                scored_candidates = []
+                for seq, score in candidates:
+                    length = seq.size(1)
+                    normalized_score = score / (length ** length_penalty)
+                    scored_candidates.append((seq, score, normalized_score))
+                
+                scored_candidates.sort(key=lambda x: x[2], reverse=True)
+                beams = [(seq, score) for seq, score, _ in scored_candidates[:beam_size]]
+                
+                # Early stopping if all beams end with EOS
+                if all(seq[0, -1].item() == eos_id for seq, _ in beams):
+                    break
+            
+            # Select best beam
+            best_seq = beams[0][0][0, 1:]  # Remove BOS, [T']
+            all_results.append(best_seq)
+        
+        # Pad results to same length
+        max_result_len = max(seq.size(0) for seq in all_results)
+        result_tensor = torch.full((B, max_result_len), eos_id, device=device, dtype=torch.long)
+        for i, seq in enumerate(all_results):
+            result_tensor[i, :seq.size(0)] = seq
+        
+        return result_tensor
+
 
 # ========================
 # InThon 규정용 Model
