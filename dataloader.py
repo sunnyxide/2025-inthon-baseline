@@ -154,7 +154,7 @@ def _gen_precedence(
 ) -> Tuple[str, int]:
     """Generate expressions with parentheses to test precedence"""
     if force_6digit_output:
-        # Large output with parentheses
+        # Large output with parentheses: use large numbers and multiplication
         a = _rand_int(rng, (4, 5))
         b = _rand_int(rng, (2, 3))
         c = _rand_int(rng, (2, 3))
@@ -165,32 +165,33 @@ def _gen_precedence(
             expr = f"{a}*({b}+{c})"
             val = a * (b + c)
     else:
-        # Normal precedence patterns
-        patterns = [
-            # Pattern 1: (a+b)*c vs a+b*c
-            lambda: (
-                f"({_rand_int(rng, (1, digit_len))}+{_rand_int(rng, (1, digit_len))})*{_rand_int(rng, (1, digit_len))}",
-                lambda a, b, c: (a + b) * c
-            ),
-            # Pattern 2: a*(b+c) vs a*b+c
-            lambda: (
-                f"{_rand_int(rng, (1, digit_len))}*({_rand_int(rng, (1, digit_len))}+{_rand_int(rng, (1, digit_len))})",
-                lambda a, b, c: a * (b + c)
-            ),
-            # Pattern 3: Nested parentheses
-            lambda: (
-                f"(({_rand_int(rng, (1, digit_len))}+{_rand_int(rng, (1, digit_len))})*{_rand_int(rng, (1, digit_len))})+{_rand_int(rng, (1, digit_len))}",
-                lambda a, b, c, d: ((a + b) * c) + d
-            ),
-        ]
-        
-        pattern = rng.choice(patterns)
-        expr_template, val_fn = pattern()
-        
-        # Extract numbers and compute value
-        numbers = [int(x) for x in re.findall(r'\d+', expr_template)]
-        val = val_fn(*numbers)
-        expr = expr_template
+        # Normal precedence patterns: use smaller numbers to avoid large outputs
+        # Limit to addition/subtraction patterns or small multiplications
+        if rng.random() < 0.6:
+            # Addition/subtraction with parentheses (smaller results)
+            a = _rand_int(rng, (1, min(3, digit_len)))
+            b = _rand_int(rng, (1, min(3, digit_len)))
+            c = _rand_int(rng, (1, min(3, digit_len)))
+            if rng.random() < 0.5:
+                expr = f"({a}+{b})-{c}"
+                val = (a + b) - c
+                if val < 0:
+                    expr = f"({a}+{b})+{c}"
+                    val = (a + b) + c
+            else:
+                expr = f"{a}+({b}+{c})"
+                val = a + (b + c)
+        else:
+            # Small multiplication patterns (limit to avoid large outputs)
+            a = _rand_int(rng, (1, min(2, digit_len)))
+            b = _rand_int(rng, (1, min(2, digit_len)))
+            c = _rand_int(rng, (1, min(2, digit_len)))
+            if rng.random() < 0.5:
+                expr = f"({a}+{b})*{c}"
+                val = (a + b) * c
+            else:
+                expr = f"{a}*({b}+{c})"
+                val = a * (b + c)
     
     return expr, val
 
@@ -267,35 +268,40 @@ def _gen_relational(
     rng: random.Random, digit_len: int, force_6digit_output: bool = False
 ) -> Tuple[str, int]:
     """Generate relational expressions (A+0, A*1, A+1, etc.)"""
-    base_val = _rand_int(rng, (1, digit_len))
-    
     if force_6digit_output:
-        # Use large base value
+        # For 6-digit output: use large base value with multiplication
         base_val = _rand_int(rng, (4, 5))
-    
-    patterns = [
-        # Identity: A+0, 0+A
-        (f"{base_val}+0", base_val),
-        (f"0+{base_val}", base_val),
-        # Identity: A*1, 1*A
-        (f"{base_val}*1", base_val),
-        (f"1*{base_val}", base_val),
-        # Zero: A*0, 0*A
-        (f"{base_val}*0", 0),
-        (f"0*{base_val}", 0),
-        # Increment: A+1, A+2
-        (f"{base_val}+1", base_val + 1),
-        (f"{base_val}+2", base_val + 2),
-    ]
-    
-    expr, val = rng.choice(patterns)
-    
-    # For 6-digit output, ensure result is large
-    if force_6digit_output and val < 100000:
-        # Use multiplication to force large output
-        multiplier = rng.randint(2, 20)
-        expr = f"{base_val}*{multiplier}"
+        # Use multiplication patterns to ensure large output
+        # Try 2-digit multiplier first
+        multiplier = rng.randint(10, 99)  # 2-digit multiplier
         val = base_val * multiplier
+        # If result is too small, use 3-digit multiplier
+        if val < 100000:
+            multiplier = rng.randint(100, 999)  # 3-digit multiplier (within 1-5 digit constraint)
+            expr = f"{base_val}*{multiplier}"
+            val = base_val * multiplier
+        else:
+            expr = f"{base_val}*{multiplier}"
+    else:
+        # Normal relational patterns with smaller values
+        base_val = _rand_int(rng, (1, digit_len))
+        
+        patterns = [
+            # Identity: A+0, 0+A
+            (f"{base_val}+0", base_val),
+            (f"0+{base_val}", base_val),
+            # Identity: A*1, 1*A
+            (f"{base_val}*1", base_val),
+            (f"1*{base_val}", base_val),
+            # Zero: A*0, 0*A
+            (f"{base_val}*0", 0),
+            (f"0*{base_val}", 0),
+            # Increment: A+1, A+2
+            (f"{base_val}+1", base_val + 1),
+            (f"{base_val}+2", base_val + 2),
+        ]
+        
+        expr, val = rng.choice(patterns)
     
     return expr, val
 
