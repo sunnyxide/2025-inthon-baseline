@@ -911,32 +911,52 @@ def train_loop(
 
                     pbar.refresh()
 
+                    # Developer log: best_em 업데이트는 early stopping 활성화 여부와 관계없이 항상 수행
+                    # 최고 성능 갱신 체크 및 best model 저장
+                    if current_em > best_em:
+                        best_em = current_em
+                        last_improvement_step = step
+                        
+                        # 최고 성능 갱신 시 전체 체크포인트 저장
+                        if train_config.save_best_path is not None:
+                            # 세 config를 dict로 변환하여 저장
+                            ckpt = {
+                                "model_state": model.state_dict(),
+                                "optim_state": optim.state_dict(),
+                                "step": step,
+                                "train_config": train_config.__dict__,  # 학습 설정 저장
+                                "model_config": model_config.__dict__,  # 모델 설정 저장
+                                "tokenizer_config": tokenizer_config.__dict__,  # 토크나이저 설정 저장
+                            }
+                            torch.save(ckpt, train_config.save_best_path)
+                            pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
+                    
                     # Early stopping 체크 (wandb sweep용)
                     should_stop = False
                     stop_reason = ""
                     
                     if train_config.enable_early_stopping:
-                        # 1. EM 개선 체크
-                        if current_em > best_em:
-                            best_em = current_em
+                        # EM 개선 체크 (best_em은 이미 위에서 업데이트되었으므로, 
+                        # current_em == best_em이면 개선된 것)
+                        if current_em == best_em and current_em > float("-inf"):
+                            # 개선된 경우 early stopping 카운터 리셋
                             no_improvement_count = 0
-                            last_improvement_step = step
                         else:
                             no_improvement_count += 1
                         
-                        # 2. 학습률이 너무 낮아졌는지 체크
+                        # 1. 학습률이 너무 낮아졌는지 체크
                         if current_lr < train_config.min_lr_threshold:
                             should_stop = True
                             stop_reason = f"Learning rate too low: {current_lr:.2e} < {train_config.min_lr_threshold:.2e}"
                         
-                        # 3. Patience 동안 개선이 없고, EM이 최소 임계값 이하인 경우
+                        # 2. Patience 동안 개선이 없고, EM이 최소 임계값 이하인 경우
                         elif (no_improvement_count >= train_config.early_stopping_patience and 
                               current_em < train_config.min_em_threshold):
                             should_stop = True
                             stop_reason = (f"No improvement for {no_improvement_count} validations "
                                          f"(EM={current_em:.3f} < {train_config.min_em_threshold:.3f})")
                         
-                        # 4. Patience 동안 개선이 없고, 충분한 step을 학습한 경우
+                        # 3. Patience 동안 개선이 없고, 충분한 step을 학습한 경우
                         elif (no_improvement_count >= train_config.early_stopping_patience and 
                               step >= train_config.warmup_steps + 5000):  # 최소 warmup + 5k step은 학습
                             should_stop = True
@@ -965,24 +985,6 @@ def train_loop(
                                 pass
                             
                             return  # train_loop 종료
-                    
-                    # 최고 성능 갱신 시 전체 체크포인트 저장
-                    # (best_em은 이미 early stopping 체크에서 업데이트됨)
-                    if train_config.save_best_path is not None:
-                        # Early stopping에서 이미 best_em이 업데이트되었으므로, 
-                        # current_em == best_em인 경우에만 저장
-                        if current_em == best_em and current_em > float("-inf"):
-                            # 세 config를 dict로 변환하여 저장
-                            ckpt = {
-                                "model_state": model.state_dict(),
-                                "optim_state": optim.state_dict(),
-                                "step": step,
-                                "train_config": train_config.__dict__,  # 학습 설정 저장
-                                "model_config": model_config.__dict__,  # 모델 설정 저장
-                                "tokenizer_config": tokenizer_config.__dict__,  # 토크나이저 설정 저장
-                            }
-                            torch.save(ckpt, train_config.save_best_path)
-                            pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
 
                     # Developer log: 카테고리별로 다양한 validation 샘플 10개 선택 (ec-focus 개선 반영)
                     pbar.write("=" * 80)
