@@ -47,7 +47,7 @@ from model import (
 
 )
 
-RPN_EXTRA_CHARS = [" ", "+", "-", "*", "/"]
+RPN_EXTRA_CHARS = [" ", "+", "-", "*", "D"]  # D는 // 연산자를 나타냄
 
 
 def _merge_chars(base_chars: List[str]) -> List[str]:
@@ -91,16 +91,18 @@ def infix_to_rpn(expr: str) -> List[str]:
     """
     Convert infix expression to RPN (Reverse Polish Notation).
     Developer log: Returns char-level tokens to avoid vocab issues.
-    "//" is split into two "/" chars for char-level tokenizer compatibility.
+    Numbers are split into individual digits for char-level tokenizer.
     
-    Example: "12//(3+4)" -> ["1", "2", "3", "4", "+", "/", "/"]
+    Example: "12+34" -> ["1", "2", "3", "4", "+"]
+    Example: "5*6" -> ["5", "6", "*"]
+    Example: "10//2" -> ["1", "0", "2", "D"] (D represents //)
     """
     expr = expr.replace(" ", "")
     output: List[str] = []
     stack: List[str] = []
 
     def precedence(op: str) -> int:
-        if op in ("*", "//", "/"):
+        if op in ("*", "D"):  # D represents //
             return 2
         if op in ("+", "-"):
             return 1
@@ -122,19 +124,13 @@ def infix_to_rpn(expr: str) -> List[str]:
                 output.append(stack.pop())
             stack.append(op)
         elif ch == "/":
-            # Check for "//"
+            # Check for "//" (몫 연산)
             if i + 1 < len(expr) and expr[i + 1] == "/":
-                # Split "//" into two "/" for char-level tokenizer
-                while stack and stack[-1] not in "(" and precedence(stack[-1]) >= precedence("/"):
+                # Use "D" as placeholder for "//" to avoid multi-char issues
+                while stack and stack[-1] not in "(" and precedence(stack[-1]) >= precedence("D"):
                     output.append(stack.pop())
-                stack.append("/")
-                stack.append("/")
+                stack.append("D")
                 i += 1  # Skip second "/"
-            else:
-                # Single "/"
-                while stack and stack[-1] not in "(" and precedence(stack[-1]) >= precedence("/"):
-                    output.append(stack.pop())
-                stack.append("/")
         elif ch == "(":
             stack.append(ch)
         elif ch == ")":
@@ -152,7 +148,7 @@ def infix_to_rpn(expr: str) -> List[str]:
         if token != "(":
             output.append(token)
 
-    return output if output else [ch for ch in expr if ch.isdigit() or ch in "+-*/"]
+    return output if output else [ch for ch in expr if ch.isdigit() or ch in "+-*"]
 
 
 def _safe_infix_to_rpn(expr: str) -> List[str]:
