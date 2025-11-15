@@ -17,11 +17,11 @@ from do_not_edit.dataloader_validator import collate_fn_with_validation
 # ---------------------------------------------------------------------------
 
 TRAINING_DISTRIBUTION = {
-    "base_calculation": 0.25,        # 40% → 25%
-    "precedence": 0.15,              # 20% → 15%
-    "expression_consistency": 0.50,  # 25% → 50% ⬆️⬆️ EC 집중!
-    "relational": 0.08,              # 10% → 8%
-    "single_number": 0.02,           # 5% → 2%
+    "base_calculation": 0.25,        # 40% → 25% (CA 유지하면서 축소)
+    "precedence": 0.15,              # 20% → 15% (LP 유지하면서 축소)
+    "expression_consistency": 0.45,  # 25% → 45% ⬆️ EC 집중! (안정적 상한선)
+    "relational": 0.10,              # 10% 유지 (RC 이미 84%로 우수)
+    "single_number": 0.05,           # 5% baseline 유지
 }
 
 PHASE_DIGIT_DISTRIBUTION = {
@@ -34,7 +34,7 @@ PHASE_DIGIT_DISTRIBUTION = {
 OUTPUT_6DIGIT_RATIO = {
     "base_calculation": 0.05,
     "precedence": 0.10,
-    "expression_consistency": 0.20,
+    "expression_consistency": 0.30,  # 0.20 → 0.30 (OOD EC 강화)
     "relational": 0.30,
     "single_number": 0.00,
 }
@@ -342,8 +342,8 @@ def _gen_expression_consistency_base(
             return f"{a}{op}{b}", (a + b if op == "+" else a * b)
         return f"{b}{op}{a}", (a + b if op == "+" else a * b)
 
-    # 70% 확률로 단순 이항 연산 (교환법칙 집중)
-    if rng.random() < 0.70:
+    # 75% 확률로 단순 이항 연산 (교환법칙 집중) - EC 강화: 60% → 75%
+    if rng.random() < 0.75:
         op = rng.choice(["+", "*"])
         a = _rand_int(rng, (1, digit_len))
         b = _rand_int(rng, (1, digit_len))
@@ -355,14 +355,23 @@ def _gen_expression_consistency_base(
         val = a + b if op == "+" else a * b
         return expr, val
 
-    # 30% 확률로 결합법칙 패턴
+    # 25% 확률로 결합법칙 패턴 ((A+B)+C vs A+(B+C))
     op = rng.choice(["+", "*"])
     a = _rand_int(rng, (1, digit_len))
     b = _rand_int(rng, (1, digit_len))
     c = _rand_int(rng, (1, digit_len))
+    
+    # 50/50으로 괄호 위치 변경 (결합법칙)
+    if rng.random() < 0.5:
+        expr = f"({a}{op}{b}){op}{c}"
+    else:
+        expr = f"{a}{op}({b}{op}{c})"
+    
     if op == "+":
-        return f"({a}+{b})+{c}", (a + b) + c
-    return f"({a}*{b})*{c}", (a * b) * c
+        val = a + b + c
+    else:
+        val = a * b * c
+    return expr, val
 
 
 def _gen_relational(
@@ -491,6 +500,12 @@ class ArithmeticDataset(Dataset):
         # Apply augmentation with appropriate probability
         if self.enable_augmentation:
             augment_prob = PHASE_AUGMENTATION_PROB.get(self.phase, 0.15)
+            
+            # EC 카테고리 전용 augmentation 강화 (핵심 개선!)
+            if category == "expression_consistency":
+                augment_prob *= 1.5  # EC는 1.5배 더 많은 augmentation
+                augment_prob = min(augment_prob, 0.80)  # 최대 80%로 제한
+            
             if rng.random() < augment_prob:
                 augmented = _safe_augment_expression(expr, val, rng)
                 if augmented:
