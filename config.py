@@ -82,6 +82,6 @@ class TrainConfig:
     val_num_samples: int = 3_000  # Larger validation coverage
     train_phase_mix: Tuple[int, ...] = (2, 3, 4)  # Phase mixture for training diversity
     val_phase: int = 4  # Validation focuses on hardest distribution
-    lambda_rpn: float = 0.2  # Auxiliary loss weight for RPN decoder
+    lambda_rpn: float = 0.0  # Auxiliary loss weight for RPN decoder (0.0 = disabled)
 
 
