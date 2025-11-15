@@ -417,16 +417,22 @@ def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examp
                 if len(shown_cats) >= 4:  # Show one from each category
                     break
     
-    # Print OOD examples directly
+    # Print OOD examples directly with model predictions
     if name == "OOD":
-        print(f"\nOOD Example expressions (direct examples):")
+        print(f"\nOOD Example expressions (direct examples with predictions):")
         ood_examples = gen_OOD_examples()
         for op_type, exprs in ood_examples.items():
             print(f"\n  {op_type.capitalize()}:")
             for expr in exprs:
                 gt_example = safe_eval(expr)
                 if gt_example is not None:
-                    print(f"    {expr} = {gt_example}")
+                    # Get model prediction
+                    pred_example = model.predict(expr)
+                    is_correct = (pred_example == gt_example)
+                    mark = "✓" if is_correct else "✗"
+                    print(f"    [{mark}] {expr}")
+                    print(f"        GT:   {gt_example}")
+                    print(f"        Pred: {pred_example}")
                 else:
                     print(f"    {expr} = (invalid/negative)")
     
