@@ -204,6 +204,9 @@ def compute_ec_consistency_loss(
     # 1) group_id -> index 리스트 매핑 생성
     group_map: dict[str, list[int]] = {}
     for idx, meta in enumerate(meta_list):
+        # Developer log: meta가 딕셔너리인지 확인하고 안전하게 처리
+        if not isinstance(meta, dict):
+            continue
         gid = meta.get("group_id")
         if gid is None:
             continue
@@ -841,7 +844,14 @@ def train_loop(
                         
                         inputs_all.extend(val_batch["input_text"])
                         if "meta" in val_batch:
-                            metas_all.extend(val_batch["meta"])
+                            # Developer log: meta가 딕셔너리 리스트인지 확인하고 안전하게 처리
+                            meta_list = val_batch["meta"]
+                            for meta_item in meta_list:
+                                if isinstance(meta_item, dict):
+                                    metas_all.append(meta_item)
+                                else:
+                                    # meta가 문자열이거나 다른 타입인 경우 빈 딕셔너리로 처리
+                                    metas_all.append({})
                         else:
                             metas_all.extend({} for _ in val_batch["input_text"])
 
@@ -862,7 +872,11 @@ def train_loop(
                     if metas_all:
                         category_indices: dict[str, List[int]] = {}
                         for idx, meta in enumerate(metas_all):
-                            cat = meta.get("category", "unknown")
+                            # Developer log: meta가 딕셔너리인지 확인하고 안전하게 처리
+                            if isinstance(meta, dict):
+                                cat = meta.get("category", "unknown")
+                            else:
+                                cat = "unknown"
                             category_indices.setdefault(cat, []).append(idx)
                         
                         cat_log_payload: dict[str, float] = {}
