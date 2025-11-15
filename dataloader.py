@@ -13,8 +13,17 @@ from torch.utils.data import DataLoader, Dataset
 from do_not_edit.dataloader_validator import collate_fn_with_validation
 
 # ---------------------------------------------------------------------------
-# Distribution targets (literature-backed v0 plan)
+# Distribution targets (operator-count focused for 1-4 operators)
 # ---------------------------------------------------------------------------
+
+# Developer log: Operator count distribution for balanced multi-operator learning
+# Fine-tuned based on empirical testing
+OPERATOR_COUNT_DISTRIBUTION = {
+    1: 0.22,  # 22% - 1개 연산자 (예: a+b, a*b)
+    2: 0.35,  # 35% - 2개 연산자 (예: a+b*c, (a+b)+c)
+    3: 0.25,  # 25% - 3개 연산자 (예: (a+b)*c-d)
+    4: 0.18,  # 18% - 4개 연산자 (예: ((a+b)*c)//d+e)
+}
 
 TRAINING_DISTRIBUTION = {
     "base_calculation": 0.20,        # Calculation Accuracy (기본 계산)
@@ -96,6 +105,20 @@ def _parse_expression(expr: str) -> List[str]:
     """
     tokens = re.findall(r'\d+|//|[+\-*/()]', expr)
     return tokens
+
+
+def _sample_operator_count(rng: random.Random) -> int:
+    """
+    Sample target operator count based on distribution.
+    Developer log: Ensures balanced 1-4 operator distribution.
+    """
+    r = rng.random()
+    cumsum = 0.0
+    for count, prob in OPERATOR_COUNT_DISTRIBUTION.items():
+        cumsum += prob
+        if r <= cumsum:
+            return count
+    return 2  # Default
 
 
 def _sample_category(rng: random.Random) -> str:
@@ -756,6 +779,241 @@ def _gen_single_number(
     return text, val
 
 
+def _gen_expr_with_target_op_count(
+    rng: random.Random,
+    target_op_count: int,
+    digit_len: int,
+    force_large: bool = False,
+) -> Tuple[str, int]:
+    """
+    Generate expression with specific operator count.
+    Developer log: Core function for balanced operator distribution (1-4 operators).
+    
+    Args:
+        target_op_count: Desired number of operators (1-4)
+        digit_len: Maximum digit length
+        force_large: Force large output (6+ digits)
+    
+    Returns:
+        (expression, value) tuple
+    """
+    # Map operator count to appropriate depth
+    depth_map = {1: 1, 2: 2, 3: 3, 4: 4}
+    target_depth = depth_map.get(target_op_count, 2)
+    
+    # Try up to 15 times to hit target operator count
+    for attempt in range(15):
+        # Select category based on operator count
+        if target_op_count == 1:
+            # Simple binary operations
+            if rng.random() < 0.5:
+                expr, val = _gen_base_calculation(rng, digit_len, force_large)
+            else:
+                expr, val = _gen_law_preservation(rng, digit_len, force_large)
+        
+        elif target_op_count == 2:
+            # 2 operators: precedence or simple chains
+            category_choice = rng.random()
+            if category_choice < 0.4:
+                expr, val = _gen_precedence(rng, digit_len, force_large)
+            elif category_choice < 0.7:
+                expr, val = _gen_base_calculation(rng, digit_len, force_large)
+            else:
+                expr, val = _gen_expression_consistency_base(rng, digit_len, force_large)
+        
+        elif target_op_count == 3:
+            # 3 operators: ALWAYS generate manually for accurate count
+            a = _rand_int(rng, (1, digit_len))
+            b = _rand_int(rng, (1, digit_len))
+            c = _rand_int(rng, (1, digit_len))
+            d = _rand_int(rng, (1, digit_len))
+            
+            # Various patterns for 3 operators
+            pattern = rng.choice(['chain', 'nested', 'mixed'])
+            
+            if pattern == 'chain':
+                # Simple chain: a op1 b op2 c op3 d
+                ops = [rng.choice(['+', '-', '*']) for _ in range(3)]
+                val = a
+                expr = str(a)
+                
+                for i, (op, num) in enumerate(zip(ops, [b, c, d])):
+                    if op == '*':
+                        val *= num
+                        expr += f"*{num}"
+                    elif op == '+':
+                        val += num
+                        expr += f"+{num}"
+                    else:  # '-'
+                        if val >= num:
+                            val -= num
+                            expr += f"-{num}"
+                        else:
+                            val += num
+                            expr += f"+{num}"
+            
+            elif pattern == 'nested':
+                # Pattern: (a op1 b) op2 c op3 d
+                op1, op2, op3 = rng.choice(['+', '*']), rng.choice(['+', '-']), rng.choice(['+', '-'])
+                
+                if op1 == '+':
+                    val1 = a + b
+                else:
+                    val1 = a * b
+                
+                val = val1
+                expr = f"({a}{op1}{b})"
+                
+                for op, num in [(op2, c), (op3, d)]:
+                    if op == '+':
+                        val += num
+                        expr += f"+{num}"
+                    else:
+                        if val >= num:
+                            val -= num
+                            expr += f"-{num}"
+                        else:
+                            val += num
+                            expr += f"+{num}"
+            
+            else:  # mixed
+                # Pattern: a op1 (b op2 c) op3 d
+                op1, op2, op3 = rng.choice(['+', '*']), rng.choice(['+', '*']), rng.choice(['+', '-'])
+                
+                if op2 == '+':
+                    val2 = b + c
+                else:
+                    val2 = b * c
+                
+                if op1 == '+':
+                    val = a + val2
+                else:
+                    val = a * val2
+                
+                if op3 == '+':
+                    val += d
+                    op3_used = '+'
+                else:
+                    if val >= d:
+                        val -= d
+                        op3_used = '-'
+                    else:
+                        val += d
+                        op3_used = '+'
+                
+                expr = f"{a}{op1}({b}{op2}{c}){op3_used}{d}"
+        
+        elif target_op_count >= 4:
+            # 4 operators: ALWAYS generate manually for accurate count
+            nums = [_rand_int(rng, (1, min(3, digit_len))) for _ in range(5)]
+            
+            # Various patterns for 4 operators
+            pattern = rng.choice(['chain', 'nested', 'mixed'])
+            
+            if pattern == 'chain':
+                # Simple chain: a op1 b op2 c op3 d op4 e
+                ops = [rng.choice(['+', '-', '*']) for _ in range(4)]
+                val = nums[0]
+                expr = str(nums[0])
+                
+                for op, num in zip(ops, nums[1:]):
+                    if op == '*':
+                        val *= num
+                        expr += f"*{num}"
+                    elif op == '+':
+                        val += num
+                        expr += f"+{num}"
+                    else:  # '-'
+                        if val >= num:
+                            val -= num
+                            expr += f"-{num}"
+                        else:
+                            val += num
+                            expr += f"+{num}"
+            
+            elif pattern == 'nested':
+                # Pattern: ((a op1 b) op2 c) op3 d op4 e
+                ops = [rng.choice(['+', '*']) for _ in range(2)] + [rng.choice(['+', '-']) for _ in range(2)]
+                
+                # First pair
+                if ops[0] == '+':
+                    val = nums[0] + nums[1]
+                else:
+                    val = nums[0] * nums[1]
+                expr = f"({nums[0]}{ops[0]}{nums[1]})"
+                
+                # Second operation
+                if ops[1] == '+':
+                    val += nums[2]
+                    expr = f"({expr}+{nums[2]})"
+                else:
+                    val *= nums[2]
+                    expr = f"({expr}*{nums[2]})"
+                
+                # Remaining operations
+                for op, num in zip(ops[2:], nums[3:]):
+                    if op == '+':
+                        val += num
+                        expr += f"+{num}"
+                    else:
+                        if val >= num:
+                            val -= num
+                            expr += f"-{num}"
+                        else:
+                            val += num
+                            expr += f"+{num}"
+            
+            else:  # mixed
+                # Pattern: a op1 (b op2 c op3 d) op4 e
+                ops = [rng.choice(['+', '*']), rng.choice(['+', '*']), rng.choice(['+', '-']), rng.choice(['+', '-'])]
+                
+                # Inner expression: b op2 c op3 d
+                if ops[1] == '+':
+                    val_inner = nums[1] + nums[2]
+                else:
+                    val_inner = nums[1] * nums[2]
+                
+                if ops[2] == '+':
+                    val_inner += nums[3]
+                    expr_inner = f"{nums[1]}{ops[1]}{nums[2]}+{nums[3]}"
+                else:
+                    if val_inner >= nums[3]:
+                        val_inner -= nums[3]
+                        expr_inner = f"{nums[1]}{ops[1]}{nums[2]}-{nums[3]}"
+                    else:
+                        val_inner += nums[3]
+                        expr_inner = f"{nums[1]}{ops[1]}{nums[2]}+{nums[3]}"
+                
+                # First operation with inner
+                if ops[0] == '+':
+                    val = nums[0] + val_inner
+                else:
+                    val = nums[0] * val_inner
+                expr = f"{nums[0]}{ops[0]}({expr_inner})"
+                
+                # Last operation
+                if ops[3] == '+':
+                    val += nums[4]
+                    expr += f"+{nums[4]}"
+                else:
+                    if val >= nums[4]:
+                        val -= nums[4]
+                        expr += f"-{nums[4]}"
+                    else:
+                        val += nums[4]
+                        expr += f"+{nums[4]}"
+        
+        # Verify operator count
+        actual_count = _count_operators(expr)
+        
+        # Accept if within ±1 of target
+        if abs(actual_count - target_op_count) <= 1:
+            return expr, val
+    
+    # Fallback: use base calculation
+    return _gen_base_calculation(rng, digit_len, force_large)
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -839,29 +1097,41 @@ class ArithmeticDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         rng = random.Random(self.seed + idx)
-        category = self._sample_category(rng)
+        
+        # Developer log: Operator-count focused generation for balanced distribution
+        # 80% operator-count controlled, 20% special categories (long_expr, etc.)
+        use_op_count_control = rng.random() < 0.80
+        
         sample_phase = self._sample_phase(rng)
         digit_len = _sample_digit_length(rng, sample_phase)
-        force_large = _should_force_large_output(rng, category)
-
-        # Generate base expression
-        if category == "base_calculation":
-            expr, val = _gen_base_calculation(rng, digit_len, force_large)
-        elif category == "precedence":
-            expr, val = _gen_precedence(rng, digit_len, force_large)
-        elif category == "law_preservation":
-            expr, val = _gen_law_preservation(rng, digit_len, force_large)
-        elif category == "expression_consistency":
-            expr, val = _gen_expression_consistency_base(rng, digit_len, force_large)
-        elif category == "relational":
-            expr, val = _gen_relational(rng, digit_len, force_large)
-        elif category == "long_expression":
-            expr, val = _gen_long_expression(rng, digit_len + 1 if force_large else digit_len)
-        elif category == "complex_nested":
-            expr, val = _gen_complex_nested(rng, digit_len, force_large)
+        
+        if use_op_count_control:
+            # Operator count based generation (1-4 operators)
+            target_op_count = _sample_operator_count(rng)
+            category = f"op{target_op_count}_expr"
+            force_large = rng.random() < 0.10  # 10% large output
+            
+            expr, val = _gen_expr_with_target_op_count(
+                rng, target_op_count, digit_len, force_large
+            )
         else:
-            expr, val = _gen_base_calculation(rng, digit_len, force_large)
-            category = "base_calculation"
+            # Special categories (long, complex nested, relational)
+            category = self._sample_category(rng)
+            force_large = _should_force_large_output(rng, category)
+            
+            if category == "long_expression":
+                expr, val = _gen_long_expression(rng, digit_len + 1 if force_large else digit_len)
+            elif category == "complex_nested":
+                expr, val = _gen_complex_nested(rng, digit_len, force_large)
+            elif category == "relational":
+                expr, val = _gen_relational(rng, digit_len, force_large)
+            else:
+                # Fallback to operator-count based
+                target_op_count = _sample_operator_count(rng)
+                expr, val = _gen_expr_with_target_op_count(
+                    rng, target_op_count, digit_len, force_large
+                )
+                category = f"op{target_op_count}_expr"
 
         # Apply augmentation with appropriate probability
         if self.enable_augmentation:
