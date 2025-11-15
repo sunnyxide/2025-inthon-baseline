@@ -1281,6 +1281,8 @@ def create_augmented_dataset_from_original(original_dataset: Dataset) -> List[Di
                 "group_id": group_id,  # Same group_id for EC
                 "meta": {**original_with_group["meta"], "augmented": True},
             }
+            # Developer log: EC consistency를 위해 meta에도 group_id 명시적으로 보존
+            aug_item["meta"]["group_id"] = group_id
             augmented_data.append(aug_item)
     
     # Remove duplicates
