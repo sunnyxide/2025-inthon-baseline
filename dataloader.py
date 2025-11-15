@@ -32,10 +32,10 @@ PHASE_DIGIT_DISTRIBUTION = {
 }
 
 OUTPUT_6DIGIT_RATIO = {
-    "base_calculation": 0.05,
-    "precedence": 0.10,
-    "expression_consistency": 0.30,  # 0.20 → 0.30 (OOD EC 강화)
-    "relational": 0.30,
+    "base_calculation": 0.15,        # 0.05 → 0.15 (큰수 연산 강화)
+    "precedence": 0.20,              # 0.10 → 0.20 (큰수 연산 강화)
+    "expression_consistency": 0.35,  # 0.30 → 0.35 (큰수 EC 강화)
+    "relational": 0.40,              # 0.30 → 0.40 (큰수 관계성 강화)
     "single_number": 0.00,
 }
 

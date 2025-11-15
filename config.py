@@ -33,7 +33,7 @@ class TrainConfig:
     grad_clip: float = 1.0  # Gradient clipping 추가 (train.py에서 사용)
     valid_every: int = 50
     max_gen_len: int = 32
-    show_valid_samples: int = 5
+    show_valid_samples: int = 10  # 카테고리별 10개 표시
     num_epochs: int = 4
     save_best_path: Optional[str] = None
     use_cosine_schedule: bool = True  # Cosine schedule 추가 (train.py에서 사용)

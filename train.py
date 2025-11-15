@@ -459,45 +459,88 @@ def train_loop(
                             torch.save(ckpt, train_config.save_best_path)
                             pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
 
-                    # 고정된 validation 샘플 표시 (원래 방식 유지 + 카테고리 라벨 추가)
-                    # Validation 데이터셋이 고정되어 있으므로, 항상 같은 인덱스의 샘플을 보여줌
-                    B = len(preds_all)  # 검증 데이터셋의 크기
-                    n_show = min(train_config.show_valid_samples, B)
-                    
+                    # 카테고리별 validation 샘플 10개 선택 및 표시
                     pbar.write("=" * 80)
-                    pbar.write("Sample Validation Output (대회 평가 기준별):")
+                    pbar.write("Sample Validation Output (카테고리별 10개):")
                     pbar.write("=" * 80)
                     
-                    for i in range(n_show):
-                        input_str = inputs_all[i]
-                        tgt = targets_all[i]
-                        pred = preds_all[i]
+                    # 카테고리별로 샘플 분류
+                    categorized_samples = {
+                        "division": [],      # 나눗셈
+                        "subtraction": [],   # 뺄셈
+                        "addition": [],      # 덧셈
+                        "multiplication": [], # 곱셈
+                        "mixed": [],         # 혼합연산
+                        "parentheses": [],   # 괄호있는연산
+                        "large_number": [],  # 자리수 큰 사칙연산 (5자리+)
+                        "commutative": [],   # 교환법칙 (A+B, A*B 형태)
+                        "with_zero": [],     # 0포함 연산
+                        "with_one": [],      # 1포함 연산
+                    }
+                    
+                    for i, (inp, tgt, pred) in enumerate(zip(inputs_all, targets_all, preds_all)):
+                        # 카테고리 판별
+                        has_paren = "(" in inp
+                        has_div = "//" in inp
+                        has_sub = "-" in inp and not inp.startswith("-")
+                        has_add = "+" in inp
+                        has_mul = "*" in inp and not has_div
+                        has_zero = "0" in inp
+                        has_one = "1" in inp
+                        result_large = len(tgt) >= 5
+                        
+                        # 연산자 개수
+                        op_count = sum([has_div, has_sub, has_add, has_mul])
+                        
+                        # 우선순위로 분류
+                        if has_paren and len(categorized_samples["parentheses"]) < 1:
+                            categorized_samples["parentheses"].append((i, inp, tgt, pred, "괄호연산"))
+                        elif result_large and len(categorized_samples["large_number"]) < 1:
+                            categorized_samples["large_number"].append((i, inp, tgt, pred, "큰수연산(5+자리)"))
+                        elif "+0" in inp or "0+" in inp and len(categorized_samples["with_zero"]) < 1:
+                            categorized_samples["with_zero"].append((i, inp, tgt, pred, "0포함연산"))
+                        elif "*1" in inp or "1*" in inp and len(categorized_samples["with_one"]) < 1:
+                            categorized_samples["with_one"].append((i, inp, tgt, pred, "1포함연산"))
+                        elif has_div and len(categorized_samples["division"]) < 1:
+                            categorized_samples["division"].append((i, inp, tgt, pred, "나눗셈"))
+                        elif has_sub and not has_add and not has_mul and len(categorized_samples["subtraction"]) < 1:
+                            categorized_samples["subtraction"].append((i, inp, tgt, pred, "뺄셈"))
+                        elif has_add and not has_sub and not has_mul and not has_div and len(categorized_samples["addition"]) < 1:
+                            categorized_samples["addition"].append((i, inp, tgt, pred, "덧셈"))
+                        elif has_mul and not has_add and not has_sub and not has_div and len(categorized_samples["multiplication"]) < 1:
+                            categorized_samples["multiplication"].append((i, inp, tgt, pred, "곱셈"))
+                        elif op_count > 1 and len(categorized_samples["mixed"]) < 1:
+                            categorized_samples["mixed"].append((i, inp, tgt, pred, "혼합연산"))
+                        elif (has_add or has_mul) and not has_paren and len(categorized_samples["commutative"]) < 1:
+                            categorized_samples["commutative"].append((i, inp, tgt, pred, "교환법칙"))
+                    
+                    # 10개 샘플 수집 (우선순위 순서)
+                    priority_categories = [
+                        "commutative", "parentheses", "large_number", "mixed",
+                        "addition", "multiplication", "subtraction", "division",
+                        "with_zero", "with_one"
+                    ]
+                    
+                    selected_samples = []
+                    for cat in priority_categories:
+                        if categorized_samples[cat]:
+                            selected_samples.append(categorized_samples[cat][0])
+                        if len(selected_samples) >= 10:
+                            break
+                    
+                    # 부족하면 앞에서부터 채우기
+                    if len(selected_samples) < 10:
+                        for i in range(min(10, len(inputs_all))):
+                            if not any(s[0] == i for s in selected_samples):
+                                selected_samples.append((i, inputs_all[i], targets_all[i], preds_all[i], "기타"))
+                            if len(selected_samples) >= 10:
+                                break
+                    
+                    # 출력
+                    for idx, (_, inp, tgt, pred, label) in enumerate(selected_samples):
                         ok = "✓" if pred == tgt else "✗"
-                        
-                        # 카테고리 라벨 추가 (표시용)
-                        category_label = ""
-                        if "(" in input_str:
-                            category_label = "[Law Preservation]"
-                        elif any(pattern in input_str for pattern in ["+0", "*1", "+1", "*0", "0+", "1*"]):
-                            category_label = "[Relational]"
-                        elif len(tgt) >= 6:
-                            category_label = "[OOD 6+dig]"
-                        elif "+" in input_str or "*" in input_str:
-                            tokens = input_str.replace("+", " ").replace("*", " ").replace("-", " ").replace("//", " ").split()
-                            if len(tokens) == 2 and "(" not in input_str:
-                                try:
-                                    int(tokens[0])
-                                    int(tokens[1])
-                                    category_label = "[Consistency]"
-                                except:
-                                    category_label = "[Calculation]"
-                            else:
-                                category_label = "[Calculation]"
-                        else:
-                            category_label = "[Calculation]"
-                        
-                        pbar.write(f"  [{i:2d}] {ok} {category_label:20s} | "
-                                 f"input: {input_str:25s} | target: {tgt:12s} | pred: {pred:12s}")
+                        pbar.write(f"  [{idx:2d}] {ok} [{label:15s}] | "
+                                 f"input: {inp:30s} | target: {tgt:12s} | pred: {pred:12s}")
                     
                     pbar.write("=" * 80)
 
@@ -723,7 +766,7 @@ def main():
         grad_clip=1.0,  # 문헌 권장
         valid_every=200,
         max_gen_len=50,
-        show_valid_samples=5,
+        show_valid_samples=10,  # 카테고리별 10개
         num_epochs=10,  # EC fine-tuning: 10 epochs
         save_best_path="best_model_ec.pt",
         use_cosine_schedule=True,  # cosine decay 유지
@@ -1000,7 +1043,7 @@ def train_run():
             grad_clip=1.0,  # 고정값: grad clip 1.0 (문헌 권장)
             valid_every=200,
             max_gen_len=50,
-            show_valid_samples=5,
+            show_valid_samples=10,  # 카테고리별 10개
             num_epochs=20,  # W&B sweep 최적값: 20 epochs
             save_best_path=f"best_{run_name}.pt",  # run_name 미리 저장한 값 사용
             use_cosine_schedule=True,  # cosine decay 유지
