@@ -388,15 +388,45 @@ def train_loop(
             if use_rpn_head and rpn_tokenizer is not None and loss_fn_rpn is not None:
                 rpn_inp_ids: List[List[int]] = []
                 rpn_out_ids: List[List[int]] = []
-                for expr in batch["input_text"]:
+                for idx, expr in enumerate(batch["input_text"]):
                     tokens = _safe_infix_to_rpn(expr)
                     rpn_text = " ".join(tokens)
+                    
+                    # Debug first batch only
+                    if step == 0 and idx == 0:
+                        print(f"\n🔍 First RPN example:")
+                        print(f"  Input expr: {expr}")
+                        print(f"  RPN tokens: {tokens}")
+                        print(f"  RPN text: '{rpn_text}'")
+                        print(f"  RPN vocab has all chars: {all(ch in rpn_tokenizer.stoi for ch in rpn_text)}")
+                        missing = [ch for ch in rpn_text if ch not in rpn_tokenizer.stoi]
+                        if missing:
+                            print(f"  ❌ Missing chars: {missing}")
+                    
                     ids_body = _encode_rpn_text(rpn_tokenizer, rpn_text)
+                    
+                    if step == 0 and idx == 0:
+                        print(f"  Encoded IDs: {ids_body}")
+                        print(f"  Max ID: {max(ids_body) if ids_body else 'N/A'}, RPN vocab size: {rpn_tokenizer.vocab_size}")
+                        print(f"  All IDs valid: {all(0 <= i < rpn_tokenizer.vocab_size for i in ids_body)}\n")
+                    
                     rpn_inp_ids.append([rpn_tokenizer.bos_id] + ids_body)
                     rpn_out_ids.append(ids_body + [rpn_tokenizer.eos_id])
 
                 rpn_inp = _pad_sequences(rpn_inp_ids, rpn_tokenizer.pad_id).to(device)
                 rpn_out = _pad_sequences(rpn_out_ids, rpn_tokenizer.pad_id).to(device)
+                
+                # Additional safety check
+                if step == 0:
+                    max_inp_val = rpn_inp.max().item()
+                    max_out_val = rpn_out.max().item()
+                    print(f"🔍 RPN tensor check:")
+                    print(f"  rpn_inp max value: {max_inp_val}, vocab size: {rpn_tokenizer.vocab_size}")
+                    print(f"  rpn_out max value: {max_out_val}, vocab size: {rpn_tokenizer.vocab_size}")
+                    if max_inp_val >= rpn_tokenizer.vocab_size:
+                        print(f"  ❌ ERROR: rpn_inp has index {max_inp_val} >= vocab size {rpn_tokenizer.vocab_size}")
+                    if max_out_val >= rpn_tokenizer.vocab_size:
+                        print(f"  ❌ ERROR: rpn_out has index {max_out_val} >= vocab size {rpn_tokenizer.vocab_size}")
 
                 result_logits, rpn_logits = model.forward_with_rpn(
                     src=src,
@@ -778,6 +808,16 @@ def main():
     )
     
     rpn_tokenizer = build_rpn_tokenizer(tokenizer_config)
+    
+    # Debug RPN tokenizer vocab
+    print("\n" + "=" * 70)
+    print("🔍 RPN Tokenizer Debugging Info")
+    print("=" * 70)
+    print(f"RPN vocab size: {rpn_tokenizer.vocab_size}")
+    print(f"RPN vocab chars: {sorted(rpn_tokenizer.stoi.keys())}")
+    print(f"OUTPUT_CHARS: {list(OUTPUT_CHARS)}")
+    print(f"RPN_EXTRA_CHARS: {RPN_EXTRA_CHARS}")
+    print("=" * 70 + "\n")
 
     # --------------------------------------------------------------------------
 
@@ -905,6 +945,13 @@ def main():
         if rpn_tokenizer is not None and train_config.lambda_rpn > 0
         else None
     )
+    
+    print(f"\n🔍 Model initialization:")
+    print(f"  in_vocab: {input_tokenizer.vocab_size}")
+    print(f"  out_vocab: {output_tokenizer.vocab_size}")
+    print(f"  rpn_vocab: {rpn_vocab}")
+    print(f"  lambda_rpn: {train_config.lambda_rpn}")
+    print()
 
     model = TransformerSeq2Seq(
         in_vocab=input_tokenizer.vocab_size,
@@ -912,6 +959,13 @@ def main():
         rpn_vocab=rpn_vocab,
         **model_config.__dict__,
     )
+    
+    # Verify RPN head was initialized correctly
+    if rpn_vocab is not None:
+        print(f"✅ RPN head initialized:")
+        print(f"  rpn_embed num_embeddings: {model.rpn_embed.num_embeddings if model.rpn_embed else 'None'}")
+        print(f"  rpn_out out_features: {model.rpn_out.out_features if model.rpn_out else 'None'}")
+        print()
 
     # --------------------------------------------------------------------------
     # 체크포인트 로드 (Resume training with compatibility check)
@@ -972,6 +1026,33 @@ def main():
                 print(f"   ℹ️ Missing keys ({len(missing_keys)}): {missing_keys[:8]}{' ...' if len(missing_keys) > 8 else ''}")
             if unexpected_keys:
                 print(f"   ℹ️ Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:8]}{' ...' if len(unexpected_keys) > 8 else ''}")
+
+            # Verify RPN head after checkpoint loading
+            if rpn_vocab is not None and model.rpn_embed is not None:
+                actual_rpn_embed_size = model.rpn_embed.num_embeddings
+                if actual_rpn_embed_size != rpn_vocab:
+                    print(f"   ⚠️ WARNING: RPN embed size mismatch!")
+                    print(f"      Expected: {rpn_vocab}, Got: {actual_rpn_embed_size}")
+                    print(f"      This will cause CUDA index errors. Reinitializing RPN head...")
+                    # Reinitialize RPN head with correct size
+                    d_model = model_config.d_model
+                    nhead = model_config.nhead
+                    dim_feedforward = model_config.dim_feedforward
+                    dropout = model_config.dropout
+                    num_decoder_layers = model_config.num_decoder_layers
+                    
+                    rpn_decoder_layer = nn.TransformerDecoderLayer(
+                        d_model=d_model,
+                        nhead=nhead,
+                        dim_feedforward=dim_feedforward,
+                        dropout=dropout,
+                        batch_first=True,
+                    )
+                    model.rpn_decoder = nn.TransformerDecoder(rpn_decoder_layer, num_layers=num_decoder_layers)
+                    model.rpn_embed = nn.Embedding(rpn_vocab, d_model)
+                    model.rpn_out = nn.Linear(d_model, rpn_vocab)
+                    model.to(device)  # Move new layers to device
+                    print(f"      ✅ RPN head reinitialized with vocab size {rpn_vocab}")
 
             if "step" in checkpoint:
                 print(f"📊 Resuming from step: {checkpoint['step']}")
