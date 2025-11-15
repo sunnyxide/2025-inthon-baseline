@@ -17,7 +17,16 @@ import os
 import sys
 
 # Add current directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Handle both regular Python and Colab environments
+try:
+    # Regular Python environment
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    # Colab environment (__file__ is not defined)
+    current_dir = os.getcwd()
+
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
 from model import Model
 
