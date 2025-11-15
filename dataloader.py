@@ -26,13 +26,13 @@ OPERATOR_COUNT_DISTRIBUTION = {
 }
 
 TRAINING_DISTRIBUTION = {
-    "base_calculation": 0.14,        # Calculation Accuracy (기본 계산)
-    "precedence": 0.18,              # Calculation Accuracy (연산 우선순위/괄호)
-    "law_preservation": 0.18,        # Law Preservation (교환/결합 법칙)
-    "expression_consistency": 0.20,  # Expression Consistency (표현 일관성)
-    "relational": 0.10,              # Relational Consistency (관계성/항등원)
-    "long_expression": 0.10,         # 긴 수식/연속 연산 집중
-    "complex_nested": 0.10,          # 복잡 중첩/괄호 패턴
+    "base_calculation": 0.10,        # Calculation Accuracy (기본 계산) - EC 강화를 위해 감소
+    "precedence": 0.15,              # Calculation Accuracy (연산 우선순위/괄호) - EC 강화를 위해 감소
+    "law_preservation": 0.15,        # Law Preservation (교환/결합 법칙) - EC 강화를 위해 감소
+    "expression_consistency": 0.35,  # Expression Consistency (표현 일관성) - EC 강화: 0.20 → 0.35 (75% 증가)
+    "relational": 0.10,              # Relational Consistency (관계성/항등원) - 유지
+    "long_expression": 0.08,         # 긴 수식/연속 연산 집중 - EC 강화를 위해 감소
+    "complex_nested": 0.07,          # 복잡 중첩/괄호 패턴 - EC 강화를 위해 감소
 }
 
 PHASE_DIGIT_DISTRIBUTION = {
@@ -46,7 +46,7 @@ OUTPUT_6DIGIT_RATIO = {
     "base_calculation": 0.05,        # 기본 계산에서 큰 출력
     "precedence": 0.18,              # 연산 우선순위에서 큰 출력
     "law_preservation": 0.20,        # 법칙 보존에서 큰 출력
-    "expression_consistency": 0.25,  # 표현 일관성에서 큰 출력
+    "expression_consistency": 0.30,  # 표현 일관성에서 큰 출력 - EC 강화: 0.25 → 0.30
     "relational": 0.30,              # 관계성에서 큰 출력
 }
 
@@ -672,29 +672,52 @@ def _gen_expression_consistency_base(
     digit_len: int,
     force_large: bool = False,
 ) -> Tuple[str, int]:
-    """Generate expressions for consistency testing."""
+    """
+    Generate expressions for consistency testing.
+    Developer log: EC 강화 - 단순 이항 연산 비중 증가, 순서 랜덤화, 결합법칙 괄호 위치 랜덤화
+    """
     if force_large:
         a = _rand_int(rng, (4, 5))
         b = _rand_int(rng, (2, 3))
+        # EC 강화: 순서 랜덤화 (50/50)
         if rng.random() < 0.5:
-            return f"{a}*{b}", a * b
-        return f"{a}+{b}", a + b
+            if rng.random() < 0.5:
+                return f"{a}*{b}", a * b
+            return f"{b}*{a}", b * a
+        else:
+            if rng.random() < 0.5:
+                return f"{a}+{b}", a + b
+            return f"{b}+{a}", b + a
 
-    if rng.random() < 0.6:
+    # EC 강화: 단순 이항 연산 비중 60% → 75%
+    if rng.random() < 0.75:
         op = rng.choice(["+", "*"])
         a = _rand_int(rng, (1, digit_len))
         b = _rand_int(rng, (1, digit_len))
-        expr = f"{a}{op}{b}"
+        # EC 강화: 순서 랜덤화 (50/50) - A+B vs B+A 균등 생성
+        if rng.random() < 0.5:
+            expr = f"{a}{op}{b}"
+        else:
+            expr = f"{b}{op}{a}"
         val = a + b if op == "+" else a * b
         return expr, val
 
+    # 결합법칙 패턴 (25%)
     op = rng.choice(["+", "*"])
     a = _rand_int(rng, (1, digit_len))
     b = _rand_int(rng, (1, digit_len))
     c = _rand_int(rng, (1, digit_len))
-    if op == "+":
-        return f"({a}+{b})+{c}", (a + b) + c
-    return f"({a}*{b})*{c}", (a * b) * c
+    # EC 강화: 결합법칙 괄호 위치 랜덤화 (50/50) - (A+B)+C vs A+(B+C) 균등 생성
+    if rng.random() < 0.5:
+        # (A op B) op C 형태
+        if op == "+":
+            return f"({a}+{b})+{c}", (a + b) + c
+        return f"({a}*{b})*{c}", (a * b) * c
+    else:
+        # A op (B op C) 형태
+        if op == "+":
+            return f"{a}+({b}+{c})", a + (b + c)
+        return f"{a}*({b}*{c})", a * (b * c)
 
 
 def _gen_relational(
@@ -1146,8 +1169,13 @@ class ArithmeticDataset(Dataset):
                 category = f"op{target_op_count}_expr"
 
         # Apply augmentation with appropriate probability
+        # Developer log: EC 강화 - expression_consistency 카테고리에 augmentation 확률 1.5배 boost
         if self.enable_augmentation:
             augment_prob = PHASE_AUGMENTATION_PROB.get(sample_phase, 0.15)
+            # EC 카테고리에 augmentation 확률 boost (EC 강화 전략)
+            if category == "expression_consistency":
+                augment_prob *= 1.5  # EC는 1.5배 boost
+                augment_prob = min(augment_prob, 0.80)  # 최대 80%로 제한
             if rng.random() < augment_prob:
                 augmented = _safe_augment_expression(expr, val, rng)
                 if augmented:
