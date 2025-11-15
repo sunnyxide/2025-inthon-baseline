@@ -243,7 +243,7 @@ def generate_datasets() -> Dict[str, List[Tuple[str, str]]]:
     
     # Regular dataset
     regular = []
-    for _ in range(500):
+    for _ in range(1000):
         cat = sample_reg()
         regular.append((cat, REG_FUNCS[cat]()))
     
@@ -259,7 +259,7 @@ def generate_datasets() -> Dict[str, List[Tuple[str, str]]]:
     # Hard RC dataset
     hard_rc = [("RC_HARD", gen_hRC()) for _ in range(200)]
     
-    print(f"Generated: regular=500, ood=200, hard_ec=200, hard_lp=200, hard_rc=200")
+    print(f"Generated: regular=1000, ood=200, hard_ec=200, hard_lp=200, hard_rc=200")
     
     return {
         "Regular": regular,
