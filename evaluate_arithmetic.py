@@ -219,18 +219,32 @@ def safe_eval(expr: str) -> str | None:
     """
     Safely evaluate arithmetic expression
     Returns None if evaluation fails
+    Developer log: Improved handling for large numbers and division by zero
     """
     try:
-        # Replace // with / for Python eval (integer division)
-        # Note: Python's // is floor division, but we want regular division for evaluation
-        # However, for consistency with training, we keep // as is
+        # Evaluate expression (Python's // is floor division)
         result = eval(expr)
-        return str(int(result)) if isinstance(result, (int, float)) else None
+        
+        # Handle None, NaN, or infinity
+        if result is None:
+            return None
+        if isinstance(result, float):
+            if not (result == result):  # NaN check
+                return None
+            if abs(result) == float('inf'):
+                return None
+        
+        # Convert to integer string
+        int_result = int(result)
+        return str(int_result)
+    except (ZeroDivisionError, ValueError, OverflowError, TypeError):
+        return None
     except Exception:
         return None
 
 
-def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examples: int = 3) -> Dict[str, Any]:
+def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examples: int = 3, 
+                 category_weights: Dict[str, float] | None = None) -> Dict[str, Any]:
     """
     Evaluate model on a dataset
     
@@ -239,6 +253,7 @@ def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examp
         data: List of (category, expression) tuples
         model: Model instance
         max_examples: Number of example predictions to print
+        category_weights: Optional dictionary of category weights for weighted scoring
     
     Returns:
         Dictionary with evaluation metrics
@@ -253,12 +268,16 @@ def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examp
     
     example_count = 0
     examples = []
+    all_expressions = []  # Store all expressions for Regular dataset examples
     
     for cat, expr in data:
         # Get ground truth
         gt = safe_eval(expr)
         if gt is None:
             continue
+        
+        # Store expression for examples
+        all_expressions.append((cat, expr))
         
         # Get model prediction
         pred = model.predict(expr)
@@ -284,29 +303,58 @@ def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examp
                 "expr": expr,
                 "gt": gt,
                 "pred": pred,
+                "cat": cat,
             })
             example_count += 1
     
     # Calculate accuracy
     accuracy = (correct / total * 100) if total > 0 else 0.0
     
+    # Calculate weighted score for Regular dataset
+    weighted_score = None
+    if category_weights and name == "Regular":
+        weighted_score = 0.0
+        total_weight = 0.0
+        for cat, weight in category_weights.items():
+            if cat in category_stats:
+                cat_acc = (category_stats[cat]["correct"] / category_stats[cat]["total"]) if category_stats[cat]["total"] > 0 else 0.0
+                weighted_score += cat_acc * weight
+                total_weight += weight
+        if total_weight > 0:
+            weighted_score = weighted_score / total_weight * 100
+    
     # Print results
     print(f"\nTotal samples: {total}")
     print(f"Correct: {correct}")
     print(f"Accuracy: {accuracy:.2f}%")
+    if weighted_score is not None:
+        print(f"Weighted Score (1.0 max): {weighted_score:.2f}%")
     
     # Print category breakdown
     if category_stats:
         print(f"\nCategory breakdown:")
         for cat, stats in sorted(category_stats.items()):
             cat_acc = (stats["correct"] / stats["total"] * 100) if stats["total"] > 0 else 0.0
-            print(f"  {cat}: {stats['correct']}/{stats['total']} ({cat_acc:.2f}%)")
+            weight_str = f" (weight: {category_weights.get(cat, 0.0):.2f})" if category_weights and cat in category_weights else ""
+            print(f"  {cat}: {stats['correct']}/{stats['total']} ({cat_acc:.2f}%){weight_str}")
+    
+    # Print example expressions for Regular dataset
+    if name == "Regular" and all_expressions:
+        print(f"\nExample expressions by category:")
+        shown_cats = set()
+        for cat, expr in all_expressions[:20]:  # Show first 20 expressions
+            if cat not in shown_cats:
+                print(f"  [{cat}] {expr}")
+                shown_cats.add(cat)
+                if len(shown_cats) >= 4:  # Show one from each category
+                    break
     
     # Print examples
     if examples:
         print(f"\nExample predictions (first {len(examples)}):")
         for ex in examples:
-            print(f"  [{ex['mark']}] {ex['expr']}")
+            cat_str = f" [{ex.get('cat', '')}]" if 'cat' in ex else ""
+            print(f"  [{ex['mark']}]{cat_str} {ex['expr']}")
             print(f"      GT:   {ex['gt']}")
             print(f"      Pred: {ex['pred']}")
     
@@ -315,6 +363,7 @@ def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examp
         "total": total,
         "correct": correct,
         "accuracy": accuracy,
+        "weighted_score": weighted_score,
         "category_stats": category_stats,
     }
 
@@ -340,7 +389,9 @@ def main():
     # Evaluate each dataset
     results = []
     for name, data in datasets.items():
-        result = eval_dataset(name, data, model, max_examples=3)
+        # Use category weights for Regular dataset
+        category_weights = REG_DIST if name == "Regular" else None
+        result = eval_dataset(name, data, model, max_examples=3, category_weights=category_weights)
         results.append(result)
     
     # Print summary
@@ -354,6 +405,8 @@ def main():
     for result in results:
         print(f"\n{result['name']}:")
         print(f"  Accuracy: {result['accuracy']:.2f}% ({result['correct']}/{result['total']})")
+        if result.get('weighted_score') is not None:
+            print(f"  Weighted Score: {result['weighted_score']:.2f}% (1.0 max)")
         total_samples += result['total']
         total_correct += result['correct']
     
