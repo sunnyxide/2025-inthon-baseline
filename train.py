@@ -1668,9 +1668,9 @@ def train_run():
 # python train.py로 실행했을 때만 main()을 돌게 합니다.
 
 if __name__ == "__main__":
-    # 단일 실행 (main 함수)
-    # main()
 
-    # Sweep 실행 (하이퍼파라미터 탐색)
-    sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
-    wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)
+    main()
+
+    #sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
+
+    #wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)
