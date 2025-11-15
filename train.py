@@ -6,6 +6,8 @@ from typing import List, Any, Tuple
 
 from config import TrainConfig, ModelConfig, TokenizerConfig
 
+import os
+
 import torch
 
 import torch.nn as nn
@@ -23,6 +25,10 @@ from dataloader import (
     get_dataloader,     # Dataset을 받아서 DataLoader로 바꿔주는 함수
 
 )
+
+# 고정된 validation 샘플 (전역 변수로 한 번만 생성)
+_FIXED_VAL_SAMPLES = None
+_FIXED_VAL_SAMPLES_INPUTS = None
 
 from do_not_edit.metric import compute_metrics  # EM, TES 같은 간단한 성능 지표
 
@@ -51,48 +57,48 @@ sweep_config = {
     },
     
     "parameters": {
-        # Learning rate (리뷰 반영: 1e-3 중심)
+        # Learning rate (증강 데이터 fine-tuning용으로 낮춤)
         "lr": {
-            "values": [1e-3, 5e-4, 2e-3],
+            "values": [1e-4, 2e-4, 5e-5],  # Fine-tuning: 기존보다 2-5배 낮춤
         },
         
-        # Model architecture (리뷰 반영: 384 기본, 512 확장)
+        # Model architecture (W&B sweep 최적값 중심으로 확장 탐색)
         "d_model": {
-            "values": [384, 512],
+            "values": [256, 384, 512],  # 256이 최적값
         },
         
-        # Attention heads (리뷰 반영: d_model에 맞춰 조정)
+        # Attention heads (W&B sweep 최적값 중심으로 확장 탐색)
         "nhead": {
-            "values": [6, 8],  # 384→6, 512→8
+            "values": [2, 4, 8],  # 2가 최적값 (256, 384, 512 모두와 호환)
         },
         
-        # Encoder/Decoder layers (리뷰 반영: 4/4 기본, 6/6 확장)
+        # Encoder/Decoder layers (W&B sweep 최적값: 6/2)
         "num_encoder_layers": {
-            "values": [4, 6],
+            "values": [4, 6, 8],  # 6이 최적값
         },
         
         "num_decoder_layers": {
-            "values": [4, 6],
+            "values": [2, 4, 6],  # 2가 최적값
         },
         
-        # FFN dimension (리뷰 반영: 4×d_model)
+        # FFN dimension (W&B sweep 최적값 중심으로 확장 탐색)
         "dim_feedforward": {
-            "values": [1536, 2048],  # 384×4=1536, 512×4=2048
+            "values": [1024, 1536, 2048],  # 1024가 최적값
         },
         
-        # Dropout (리뷰 반영: 0.1 기본, 0.2 과적합 시)
+        # Dropout (W&B sweep 최적값: 0.0)
         "dropout": {
-            "values": [0.1, 0.2],
+            "values": [0.0, 0.1, 0.2],  # 0.0이 최적값
         },
         
-        # Batch size (4GB 환경 고려)
+        # Batch size (W&B sweep 최적값: 128)
         "batch_size": {
-            "values": [64, 128],
+            "values": [64, 128, 256],  # 128이 최적값
         },
         
-        # Data phase (리뷰 반영: phase 기반)
+        # Data phase (W&B sweep 최적값: phase 2-3에 해당)
         "phase": {
-            "values": [3, 4],  # Phase 3: 3-4자리, Phase 4: 4-5자리
+            "values": [2, 3, 4],  # max_depth 2-3에 해당
         },
     },
 }
@@ -175,8 +181,12 @@ def train_loop(
     pbar = tqdm(total=train_config.max_train_steps if train_config.max_train_steps is not None else None, desc="train", unit="step", ncols=120, dynamic_ncols=True, leave=True)
 
     # best EM 추적용 변수 (None이 아니면 개선 시 모델 저장)
-
     best_em = float("-inf")
+    
+    # Early stopping 관련 변수 (wandb sweep용)
+    no_improvement_count = 0  # 개선 없는 validation 횟수
+    last_improvement_step = 0  # 마지막 개선 step
+    initial_lr = train_config.lr  # 초기 학습률
 
     for epoch in range(train_config.num_epochs):
 
@@ -354,86 +364,156 @@ def train_loop(
                         inputs_all.extend(val_batch["input_text"])
 
                     # 검증 데이터셋의 예측, 정답을 사용하여 성능 지표를 계산합니다.
-
                     em_batch = compute_metrics(preds_all, targets_all)
+                    current_em = float(em_batch.get("EM", -1.0))
+                    current_lr = optim.param_groups[0]['lr']
 
                     wandb.log(
-
                         {
-
                             "valid/EM": em_batch["EM"],
-
                             "valid/TES": em_batch["TES"],
-
                             "step": step,
-
                         }
-
                     )
 
                     # 진행바에도 성능을 표시합니다.
-
-                    pbar.write(f"[valid {step}] EM={em_batch['EM']:.3f} TES={em_batch['TES']:.3f}")
+                    pbar.write(f"[valid {step}] EM={em_batch['EM']:.3f} TES={em_batch['TES']:.3f} LR={current_lr:.2e}")
 
                     pbar.set_postfix(
-
                         EM=f"{em_batch['EM']:.3f}",
-
                         TES=f"{em_batch['TES']:.3f}",
-
                     )
 
                     pbar.refresh()
 
-                    # 최고 성능 갱신 시 전체 체크포인트 저장
-
-                    if train_config.save_best_path is not None:
-
-                        current_em = float(em_batch.get("EM", -1.0))
-
+                    # Early stopping 체크 (wandb sweep용)
+                    should_stop = False
+                    stop_reason = ""
+                    
+                    if train_config.enable_early_stopping:
+                        # 1. EM 개선 체크
                         if current_em > best_em:
-
                             best_em = current_em
-
+                            no_improvement_count = 0
+                            last_improvement_step = step
+                        else:
+                            no_improvement_count += 1
+                        
+                        # 2. 학습률이 너무 낮아졌는지 체크
+                        if current_lr < train_config.min_lr_threshold:
+                            should_stop = True
+                            stop_reason = f"Learning rate too low: {current_lr:.2e} < {train_config.min_lr_threshold:.2e}"
+                        
+                        # 3. Patience 동안 개선이 없고, EM이 최소 임계값 이하인 경우
+                        elif (no_improvement_count >= train_config.early_stopping_patience and 
+                              current_em < train_config.min_em_threshold):
+                            should_stop = True
+                            stop_reason = (f"No improvement for {no_improvement_count} validations "
+                                         f"(EM={current_em:.3f} < {train_config.min_em_threshold:.3f})")
+                        
+                        # 4. Patience 동안 개선이 없고, 충분한 step을 학습한 경우
+                        elif (no_improvement_count >= train_config.early_stopping_patience and 
+                              step >= train_config.warmup_steps + 5000):  # 최소 warmup + 5k step은 학습
+                            should_stop = True
+                            stop_reason = (f"No improvement for {no_improvement_count} validations "
+                                         f"after {step} steps (best EM: {best_em:.3f})")
+                        
+                        if should_stop:
+                            pbar.write("=" * 80)
+                            pbar.write(f"⚠️  Early stopping triggered: {stop_reason}")
+                            pbar.write(f"   Best EM: {best_em:.3f} at step {last_improvement_step}")
+                            pbar.write(f"   Current EM: {current_em:.3f}, LR: {current_lr:.2e}")
+                            pbar.write("=" * 80)
+                            
+                            # wandb에 early stopping 정보 로깅
+                            wandb.log({
+                                "early_stopping/triggered": True,
+                                "early_stopping/reason": stop_reason,
+                                "early_stopping/best_em": best_em,
+                                "early_stopping/step": step,
+                            })
+                            
+                            # wandb run 종료하여 다음 파라미터 조합으로 넘어가기
+                            try:
+                                wandb.finish()
+                            except:
+                                pass
+                            
+                            return  # train_loop 종료
+                    
+                    # 최고 성능 갱신 시 전체 체크포인트 저장
+                    # (best_em은 이미 early stopping 체크에서 업데이트됨)
+                    if train_config.save_best_path is not None:
+                        # Early stopping에서 이미 best_em이 업데이트되었으므로, 
+                        # current_em == best_em인 경우에만 저장
+                        if current_em == best_em and current_em > float("-inf"):
                             # 세 config를 dict로 변환하여 저장
-
                             ckpt = {
-
                                 "model_state": model.state_dict(),
-
                                 "optim_state": optim.state_dict(),
-
                                 "step": step,
-
                                 "train_config": train_config.__dict__,  # 학습 설정 저장
-
                                 "model_config": model_config.__dict__,  # 모델 설정 저장
-
                                 "tokenizer_config": tokenizer_config.__dict__,  # 토크나이저 설정 저장
-
                             }
-
                             torch.save(ckpt, train_config.save_best_path)
-
                             pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
 
-                    B = len(preds_all) # 검증 데이터셋의 크기
-
+                    # 고정된 validation 샘플 표시 (원래 방식 유지 + 카테고리 라벨 추가)
+                    # Validation 데이터셋이 고정되어 있으므로, 항상 같은 인덱스의 샘플을 보여줌
+                    B = len(preds_all)  # 검증 데이터셋의 크기
                     n_show = min(train_config.show_valid_samples, B)
-
-                    pbar.write("Sample validation output:") # 예시로 몇 개만 보여줍니다.
-
+                    
+                    pbar.write("=" * 80)
+                    pbar.write("Sample Validation Output (대회 평가 기준별):")
+                    pbar.write("=" * 80)
+                    
                     for i in range(n_show):
-
                         input_str = inputs_all[i]
-
                         tgt = targets_all[i]
-
                         pred = preds_all[i]
-
-                        ok = "OK" if pred == tgt else "ERR"
-
-                        pbar.write(f"  [{i}] {ok} | input: {input_str} | target: {tgt} | pred: {pred}")
+                        ok = "✓" if pred == tgt else "✗"
+                        
+                        # 카테고리 라벨 + 자리수 정보 추가
+                        import re
+                        category_label = ""
+                        digit_info = ""
+                        
+                        # 입력 수식에서 숫자 추출 및 자리수 분석
+                        numbers = re.findall(r'\d+', input_str)
+                        if numbers:
+                            max_digits = max(len(n) for n in numbers)
+                            num_count = len(numbers)
+                            digit_info = f"{num_count}n{max_digits}d"
+                        
+                        # 상세 카테고리 분류
+                        if "(" in input_str and "*" in input_str and ("+" in input_str or "-" in input_str):
+                            category_label = "[Mix:Paren*±]"  # 괄호+혼합
+                        elif "(" in input_str:
+                            category_label = "[Parentheses]"
+                        elif "//" in input_str:
+                            category_label = "[Division]"
+                        elif "-" in input_str and "+" not in input_str and "*" not in input_str:
+                            category_label = "[Subtraction]"
+                        elif any(pattern in input_str for pattern in ["+0", "*1", "+1", "*0", "0+", "1*"]):
+                            category_label = "[Identity]"
+                        elif len(tgt) >= 6:
+                            category_label = "[OOD:6+dig]"
+                        elif "*" in input_str and "+" not in input_str and "-" not in input_str:
+                            category_label = "[Multiply]"
+                        elif "+" in input_str and "*" not in input_str and "-" not in input_str:
+                            category_label = "[Addition]"
+                        elif "*" in input_str and "+" in input_str:
+                            category_label = "[Mix:*+]"
+                        elif "*" in input_str and "-" in input_str:
+                            category_label = "[Mix:*-]"
+                        else:
+                            category_label = "[Basic]"
+                        
+                        pbar.write(f"  [{i:2d}] {ok} {category_label:16s} {digit_info:7s} | "
+                                 f"in: {input_str:28s} | tgt: {tgt:9s} | pred: {pred:9s}")
+                    
+                    pbar.write("=" * 80)
 
                 model.train()  # 다시 학습 모드로
 
@@ -453,6 +533,17 @@ def train_loop(
 
 def main():
 
+    # Wandb 초기화
+    wandb.init(
+        project="inthon-2025-arithmetic",
+        name="checkpoint-resume-training",
+        config={
+            "mode": "checkpoint_resume",
+            "augmentation": True,
+            "phase": 2,
+        }
+    )
+
     # GPU가 있으면 GPU, 없으면 CPU 사용
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -465,10 +556,10 @@ def main():
 
     # Train Dataset, 자세한 설정은 dataloader.py를 참고하세요.
 
-    # 리뷰 반영: 새로운 dataloader 사용
+    # A100 GPU 최적화: 대형 데이터셋 (200k → 800k)
     train_dataset = ArithmeticDataset(
-        num_samples=200_000,  # 리뷰 반영: 적당한 샘플 수
-        phase=4,  # Phase 4: 4-5자리
+        num_samples=800_000,  # A100 대형 학습: 800,000 samples
+        phase=3,  # Phase 3: 더 복잡한 데이터 (3-4자리)
         seed=123,
         mode="train",
         enable_augmentation=True,
@@ -480,7 +571,7 @@ def main():
 
         train_dataset,
 
-        batch_size=128,
+        batch_size=512,  # A100 최적화: 128 → 512
 
         num_workers=0,
 
@@ -488,28 +579,47 @@ def main():
 
     )
 
-    # Validation Dataset, 자세한 설정은 dataloader.py를 참고하세요.
-
-    val_dataset = ArithmeticDataset(
-        num_samples=1000,  # 검증 샘플 수 증가
-        phase=4,
-        seed=999,
-        mode="val",
-        enable_augmentation=False,  # 검증에서는 증강 비활성화
-    )
-
+    # Validation Dataset: 고정된 validation 샘플 사용
+    global _FIXED_VAL_SAMPLES, _FIXED_VAL_SAMPLES_INPUTS
+    
+    if _FIXED_VAL_SAMPLES is None:
+        # 고정된 validation dataset 생성 (A100 최적화: validation 샘플 증가)
+        fixed_val_dataset = ArithmeticDataset(
+            num_samples=2000,  # Validation 샘플 증가: 1000 → 2000
+            phase=4,  # Phase 4: 더 어려운 검증 데이터 (4-5자리)
+            seed=999,  # 고정된 seed
+            mode="val",
+            enable_augmentation=False,
+        )
+        # Validation 샘플을 미리 생성하여 저장
+        _FIXED_VAL_SAMPLES = []
+        _FIXED_VAL_SAMPLES_INPUTS = set()
+        for i in range(len(fixed_val_dataset)):
+            sample = fixed_val_dataset[i]
+            _FIXED_VAL_SAMPLES.append(sample)
+            _FIXED_VAL_SAMPLES_INPUTS.add(sample["input_text"])
+    
+    # 고정된 validation 샘플을 사용하는 Dataset wrapper
+    class FixedValidationDataset:
+        def __init__(self, samples):
+            self.samples = samples
+            self.mode = "val"
+        
+        def __len__(self):
+            return len(self.samples)
+        
+        def __getitem__(self, idx):
+            return self.samples[idx]
+    
+    val_dataset = FixedValidationDataset(_FIXED_VAL_SAMPLES)
+    
     # Validation DataLoader, 자세한 설정은 dataloader.py를 참고하세요.
-
     val_dataloader = get_dataloader(
-
         val_dataset,
-
-        batch_size=128,
-
+        batch_size=512,  # A100 최적화: 128 → 512
         num_workers=0,
-
         pin_memory=True,
-
+        mode="val",
     )
 
     # --------------------------------------------------------------------------
@@ -608,28 +718,33 @@ def main():
 
     #-----------------------------
 
-    # 리뷰 반영: 기본값 업데이트
+    # A100 GPU 최적화된 모델 설정
     model_config = ModelConfig(
-        d_model=384,  # 리뷰 반영: 384
-        nhead=6,  # 리뷰 반영: 6
-        num_encoder_layers=4,
-        num_decoder_layers=4,
-        dim_feedforward=1536,  # 리뷰 반영: 4×384=1536
-        dropout=0.1,
+        d_model=512,  # A100 최적화: 256 → 512
+        nhead=8,  # A100 최적화: 2 → 8
+        num_encoder_layers=8,  # A100 최적화: 6 → 8
+        num_decoder_layers=4,  # A100 최적화: 2 → 4
+        dim_feedforward=2048,  # A100 최적화: 1024 → 2048
+        dropout=0.0,  # W&B sweep 최적값 (과적합 없음)
     )
 
     train_config = TrainConfig(
         max_train_steps=None,
-        lr=1e-3,  # 리뷰 반영: 1e-3
-        warmup_steps=5000,  # 리뷰 반영: warmup 5k
-        weight_decay=0.1,  # 리뷰 반영: weight decay 0.1
-        grad_clip=1.0,  # 리뷰 반영: grad clip 1.0
-        valid_every=200,
-        max_gen_len=50,  # 리뷰 반영: 50
-        show_valid_samples=5,
-        num_epochs=10,
+        lr=3e-4,  # A100 대형 모델용 학습률: 2e-4 → 3e-4
+        warmup_steps=8000,  # 대형 데이터셋용: 5000 → 8000
+        weight_decay=0.1,  # 문헌 권장
+        grad_clip=1.0,  # 문헌 권장
+        valid_every=500,  # 대형 데이터셋: 200 → 500
+        max_gen_len=50,
+        show_valid_samples=10,  # 더 다양한 샘플 확인
+        num_epochs=30,  # 대형 데이터셋: 20 → 30 epochs
+        batch_size=512,  # A100 최적화: 128 → 512
         save_best_path="best_model.pt",
-        use_cosine_schedule=True,  # 리뷰 반영: cosine decay
+        use_cosine_schedule=True,  # cosine decay 유지
+        enable_early_stopping=False,  # main()에서는 early stopping 비활성화 (전체 학습)
+        early_stopping_patience=8,  # 대형 모델: 5 → 8
+        min_lr_threshold=1e-6,
+        min_em_threshold=0.01,
     )
 
     # --------------------------------------------------------------------------
@@ -659,6 +774,80 @@ def main():
     out_vocab=output_tokenizer.vocab_size,
 
      **model_config.__dict__,)
+
+    # --------------------------------------------------------------------------
+    # 체크포인트 로드 (Resume training with compatibility check)
+    # --------------------------------------------------------------------------
+    
+    resume_checkpoint = "best_model.pt"  # 체크포인트 파일 경로
+    resume_from_checkpoint = True  # True로 설정하면 체크포인트에서 재개
+    
+    # A100 최적화 전 모델 설정 (d_model=256, nhead=2)
+    OLD_MODEL_CONFIG = {
+        "d_model": 256,
+        "nhead": 2,
+        "num_encoder_layers": 6,
+        "num_decoder_layers": 2,
+        "dim_feedforward": 1024,
+        "dropout": 0.0,
+    }
+    
+    if resume_from_checkpoint and os.path.exists(resume_checkpoint):
+        print("=" * 70)
+        print(f"🔄 Checking checkpoint: {resume_checkpoint}")
+        print("=" * 70)
+        
+        try:
+            # 체크포인트 로드
+            checkpoint = torch.load(resume_checkpoint, map_location=device)
+            
+            # 저장된 설정 확인 및 비교
+            config_match = True
+            if "model_config" in checkpoint:
+                saved_config = checkpoint["model_config"]
+                print("\n📋 Checkpoint Configuration Comparison:")
+                print(f"{'Parameter':<25} {'Current':<12} {'Saved':<12} {'Match'}")
+                print("-" * 70)
+                
+                for key in ["d_model", "nhead", "num_encoder_layers", "num_decoder_layers", "dim_feedforward", "dropout"]:
+                    current_val = model_config.__dict__[key]
+                    saved_val = saved_config.get(key, "N/A")
+                    is_match = current_val == saved_val
+                    match_symbol = "✅" if is_match else "❌"
+                    print(f"{key:<25} {str(current_val):<12} {str(saved_val):<12} {match_symbol}")
+                    if not is_match:
+                        config_match = False
+            
+            if config_match:
+                # 설정이 일치하는 경우: 체크포인트에서 로드
+                model.load_state_dict(checkpoint["model_state"])
+                print("\n✅ Configuration matches! Model weights loaded successfully")
+                if "step" in checkpoint:
+                    print(f"📊 Resuming from step: {checkpoint['step']}")
+            else:
+                # 설정이 다른 경우: 새로 학습 시작
+                print("\n⚠️  Model configuration mismatch detected!")
+                print("   Current model is LARGER than checkpoint model.")
+                print("   🚀 Starting training from scratch with A100-optimized model.")
+                print("\n💡 To use the old checkpoint, change ModelConfig back to:")
+                for key, val in OLD_MODEL_CONFIG.items():
+                    print(f"     {key}: {val}")
+            
+            print("=" * 70)
+            print()
+            
+        except Exception as e:
+            print(f"\n❌ Failed to load checkpoint: {e}")
+            print("Starting training from scratch...")
+            print("=" * 70)
+            print()
+    
+    elif resume_from_checkpoint and not os.path.exists(resume_checkpoint):
+        print("=" * 70)
+        print(f"ℹ️  Checkpoint file not found: {resume_checkpoint}")
+        print("🚀 Starting training from scratch with A100-optimized model...")
+        print("=" * 70)
+        print()
 
     # --------------------------------------------------------------------------
 
@@ -699,61 +888,77 @@ def main():
     print("Saved model.pt")
 
 def train_run():
-
+    global _FIXED_VAL_SAMPLES, _FIXED_VAL_SAMPLES_INPUTS
+    
     # GPU/CPU
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # wandb.init: sweep에서는 config를 넘겨주지 않고, agent가 알아서 주입
-
     with wandb.init(project="inthon-2025-arithmetic"):
-
         cfg = wandb.config
+        run_name = wandb.run.name  # 미리 저장 (finish 후 접근 불가)
 
         # ----------------------------------------------------------------------
-
-        # 1) 데이터 준비 (cfg 기반)
+        # 1) 고정된 Validation 데이터셋 생성 (한 번만)
+        # ----------------------------------------------------------------------
+        if _FIXED_VAL_SAMPLES is None:
+            # 고정된 validation dataset 생성 (W&B sweep 최적값 적용: max_depth_val=3 → phase=3)
+            fixed_val_dataset = ArithmeticDataset(
+                num_samples=1000,
+                phase=3,  # Phase 3: max_depth_val=3에 해당 (3-4자리)
+                seed=999,  # 고정된 seed
+                mode="val",
+                enable_augmentation=False,
+            )
+            # Validation 샘플을 미리 생성하여 저장
+            _FIXED_VAL_SAMPLES = []
+            _FIXED_VAL_SAMPLES_INPUTS = set()
+            for i in range(len(fixed_val_dataset)):
+                sample = fixed_val_dataset[i]
+                _FIXED_VAL_SAMPLES.append(sample)
+                _FIXED_VAL_SAMPLES_INPUTS.add(sample["input_text"])
+        
+        # 고정된 validation 샘플로 dataset 생성
+        # 고정된 validation 샘플을 사용하는 간단한 Dataset wrapper
+        class FixedValidationDataset:
+            def __init__(self, samples):
+                self.samples = samples
+                self.mode = "val"  # mode 속성 추가 (get_dataloader에서 사용)
+            
+            def __len__(self):
+                return len(self.samples)
+            
+            def __getitem__(self, idx):
+                return self.samples[idx]
+        
+        val_dataset = FixedValidationDataset(_FIXED_VAL_SAMPLES)
+        val_dataloader = get_dataloader(
+            val_dataset,
+            batch_size=cfg.batch_size,
+            num_workers=0,
+            pin_memory=True,
+            mode="val",
+        )
 
         # ----------------------------------------------------------------------
-
+        # 2) Train 데이터 준비 (validation 샘플 제외)
+        # ----------------------------------------------------------------------
+        # Train dataset 생성 시 validation 샘플과 겹치지 않도록 다른 seed 사용
+        # (validation seed=999, train seed=123으로 이미 다름)
+        # W&B sweep 최적값 적용: max_depth_train=2 → phase=2
         train_dataset = ArithmeticDataset(
-            num_samples=200_000,  # 리뷰 반영: 적당한 샘플 수
-            phase=cfg.get("phase", 4),  # 리뷰 반영: phase 기반
-            seed=123,
+            num_samples=200_000,  # 적당한 샘플 수
+            phase=cfg.get("phase", 2),  # 기본값: phase 2 (W&B sweep 최적값)
+            seed=123,  # Train용 고정 seed (validation과 다름)
             mode="train",
             enable_augmentation=True,
         )
 
         train_dataloader = get_dataloader(
-
             train_dataset,
-
             batch_size=cfg.batch_size,
-
             num_workers=0,
-
             pin_memory=True,
-
-        )
-
-        val_dataset = ArithmeticDataset(
-            num_samples=1000,  # 검증 샘플 수 증가
-            phase=cfg.get("phase", 4),
-            seed=999,
-            mode="val",
-            enable_augmentation=False,  # 검증에서는 증강 비활성화
-        )
-
-        val_dataloader = get_dataloader(
-
-            val_dataset,
-
-            batch_size=cfg.batch_size,
-
-            num_workers=0,
-
-            pin_memory=True,
-
         )
 
         # ----------------------------------------------------------------------
@@ -816,18 +1021,24 @@ def train_run():
 
         # ----------------------------------------------------------------------
 
+        # TrainConfig 생성 시 cfg에서 필요한 값만 명시적으로 전달
+        # (Wandb가 cfg에 예상치 못한 키를 추가할 수 있으므로 명시적으로 처리)
         train_config = TrainConfig(
             max_train_steps=None,
             lr=cfg.lr,
-            warmup_steps=5000,  # 리뷰 반영: warmup 5k steps
-            weight_decay=0.1,  # 리뷰 반영: weight decay 0.1
-            grad_clip=1.0,  # 리뷰 반영: grad clip 1.0
+            warmup_steps=5000,  # 고정값: warmup 5k steps (문헌 권장)
+            weight_decay=0.1,  # 고정값: weight decay 0.1 (문헌 권장)
+            grad_clip=1.0,  # 고정값: grad clip 1.0 (문헌 권장)
             valid_every=200,
-            max_gen_len=50,  # 리뷰 반영: max_gen_len 50
+            max_gen_len=50,
             show_valid_samples=5,
-            num_epochs=10,
-            save_best_path=f"best_{wandb.run.name}.pt" if wandb.run else "best_model.pt",
-            use_cosine_schedule=True,  # 리뷰 반영: cosine decay
+            num_epochs=20,  # W&B sweep 최적값: 20 epochs
+            save_best_path=f"best_{run_name}.pt",  # run_name 미리 저장한 값 사용
+            use_cosine_schedule=True,  # cosine decay 유지
+            enable_early_stopping=True,  # wandb sweep용 early stopping 활성화
+            early_stopping_patience=5,  # 5번의 validation 동안 개선 없으면 종료
+            min_lr_threshold=1e-6,  # 학습률이 1e-6 이하로 떨어지면 종료
+            min_em_threshold=0.01,  # EM이 0.01 이하이고 patience 초과 시 종료
         )
 
         # ----------------------------------------------------------------------
@@ -875,17 +1086,16 @@ def train_run():
         )
 
         # 원하면 각 run 끝에 최종 모델도 따로 저장 가능
-
+        # wandb.run.name은 finish 후 접근 불가하므로 미리 저장한 값 사용
         torch.save(model.state_dict(), "model_last.pt")
-
-        print("Saved model_last.pt for run:", wandb.run.name)
+        print("Saved model_last.pt for run:", run_name)
 
 # python train.py로 실행했을 때만 main()을 돌게 합니다.
 
 if __name__ == "__main__":
 
-    #main()
+    main()
 
-    sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
+    #sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
 
-    wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)
+    #wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)

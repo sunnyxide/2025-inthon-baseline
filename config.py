@@ -13,29 +13,36 @@ class TokenizerConfig:
 
 @dataclass
 class ModelConfig:
-    """모델 아키텍처 관련 설정 (리뷰 기반 최적화)"""
-    d_model: int = 384  # Hidden dimension (문헌 검증: 384는 산술 학습에 최적)
-    nhead: int = 6  # Attention heads (d_model 384 → head dim 64)
-    num_encoder_layers: int = 4  # Encoder layers
-    num_decoder_layers: int = 4  # Decoder layers
-    dim_feedforward: int = 1536  # FFN dimension (4×d_model, 표준값)
-    dropout: float = 0.1  # Dropout (과적합 시 0.2로 증가)
-    # 향후 확장 가능: positional encoding type (NoPE/FIRE), abacus embedding 등
+    """모델 아키텍처 관련 설정 (A100 GPU 최적화)"""
+    d_model: int = 512  # Hidden dimension (A100 최적화: 256 → 512)
+    nhead: int = 8  # Attention heads (A100 최적화: 2 → 8)
+    num_encoder_layers: int = 8  # Encoder layers (A100 최적화: 6 → 8)
+    num_decoder_layers: int = 4  # Decoder layers (A100 최적화: 2 → 4)
+    dim_feedforward: int = 2048  # FFN dimension (A100 최적화: 1024 → 2048)
+    dropout: float = 0.0  # Dropout (W&B sweep 최적값: 0으로 과적합 방지 불필요)
+    # A100 GPU에 최적화된 대형 모델 설정
+    # 이전 best_model.pt(d_model=256)와 호환되지 않음 - 새로운 학습 시작 필요
 
 
 @dataclass
 class TrainConfig:
-    """학습 관련 설정 (리뷰 기반 최적화)"""
+    """학습 관련 설정 (A100 GPU 최적화)"""
     max_train_steps: Optional[int] = None
-    lr: float = 1e-3  # Learning rate (AdamW + warmup 5k + cosine decay)
-    warmup_steps: int = 5000  # Warmup steps (문헌 권장)
+    lr: float = 3e-4  # Learning rate (A100용 대형 모델: 5e-4 → 3e-4로 안정화)
+    warmup_steps: int = 8000  # Warmup steps (대형 데이터셋용: 5000 → 8000)
     weight_decay: float = 0.1  # Weight decay (문헌 권장)
     grad_clip: float = 1.0  # Gradient clipping (문헌 권장)
-    valid_every: int = 200  # Validation frequency
+    valid_every: int = 500  # Validation frequency (대형 데이터셋: 200 → 500)
     max_gen_len: int = 50  # Max generation length (문헌 권장: 50)
-    show_valid_samples: int = 5
-    num_epochs: int = 10
+    show_valid_samples: int = 10  # Sample display count (5 → 10)
+    num_epochs: int = 30  # Epochs (대형 데이터셋: 20 → 30)
+    batch_size: int = 512  # Batch size (A100 최적화: 128 → 512)
     save_best_path: Optional[str] = None
     use_cosine_schedule: bool = True  # Use cosine decay after warmup
+    # Early stopping for wandb sweep
+    early_stopping_patience: int = 8  # Patience (대형 모델: 5 → 8)
+    min_lr_threshold: float = 1e-6  # Minimum learning rate threshold (below this, stop training)
+    min_em_threshold: float = 0.01  # Minimum EM threshold (below this after patience, stop)
+    enable_early_stopping: bool = True  # Enable early stopping for wandb sweep
 
 
