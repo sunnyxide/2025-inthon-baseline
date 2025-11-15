@@ -43,81 +43,58 @@ from model import (
 )
 
 sweep_config = {
-
-    "method": "random",   # "random", "grid", "bayes" 중 선택
-
+    "method": "random",  # "random", "grid", "bayes" 중 선택
+    
     "metric": {
-
         "name": "valid/EM",
-
         "goal": "maximize",
-
     },
-
+    
     "parameters": {
-
+        # Learning rate (리뷰 반영: 1e-3 중심)
         "lr": {
-
-            "values": [1e-3, 2e-3, 5e-4],
-
+            "values": [1e-3, 5e-4, 2e-3],
         },
-
+        
+        # Model architecture (리뷰 반영: 384 기본, 512 확장)
         "d_model": {
-
-            "values": [128, 256, 512],
-
+            "values": [384, 512],
         },
-
+        
+        # Attention heads (리뷰 반영: d_model에 맞춰 조정)
         "nhead": {
-
-            "values": [2, 4, 8],
-
+            "values": [6, 8],  # 384→6, 512→8
         },
-
+        
+        # Encoder/Decoder layers (리뷰 반영: 4/4 기본, 6/6 확장)
         "num_encoder_layers": {
-
-            "values": [2, 4, 6],
-
+            "values": [4, 6],
         },
-
+        
         "num_decoder_layers": {
-
-            "values": [2, 4, 6],
-
+            "values": [4, 6],
         },
-
+        
+        # FFN dimension (리뷰 반영: 4×d_model)
         "dim_feedforward": {
-
-            "values": [256, 512, 1024],
-
+            "values": [1536, 2048],  # 384×4=1536, 512×4=2048
         },
-
+        
+        # Dropout (리뷰 반영: 0.1 기본, 0.2 과적합 시)
         "dropout": {
-
-            "values": [0.0, 0.1, 0.2],
-
+            "values": [0.1, 0.2],
         },
-
+        
+        # Batch size (4GB 환경 고려)
         "batch_size": {
-
             "values": [64, 128],
-
         },
-
-        "max_depth_train": {
-
-            "values": [2, 3, 4],
-
+        
+        # Data phase (리뷰 반영: phase 기반)
+        "phase": {
+            "values": [3, 4],  # Phase 3: 3-4자리, Phase 4: 4-5자리
         },
-
-        "max_depth_val": {
-
-            "values": [3, 4],
-
-        },
-
     },
-
 }
 
 # ======================================================================================
@@ -154,9 +131,34 @@ def train_loop(
 
     model.to(device)
 
-    # 옵티마이저: AdamW는 Adam + weight decay가 들어간 버전
-
-    optim = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
+    # 옵티마이저: AdamW with weight decay (리뷰 반영)
+    optim = torch.optim.AdamW(
+        model.parameters(), 
+        lr=train_config.lr,
+        weight_decay=train_config.weight_decay
+    )
+    
+    # Learning rate scheduler: warmup + cosine decay (리뷰 반영)
+    if train_config.use_cosine_schedule:
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        warmup_scheduler = LinearLR(
+            optim, 
+            start_factor=0.1, 
+            end_factor=1.0, 
+            total_iters=train_config.warmup_steps
+        )
+        cosine_scheduler = CosineAnnealingLR(
+            optim,
+            T_max=max(1, (train_config.max_train_steps or 100000) - train_config.warmup_steps),
+            eta_min=1e-6
+        )
+        scheduler = SequentialLR(
+            optim,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[train_config.warmup_steps]
+        )
+    else:
+        scheduler = None
 
     # seq2seq에서 흔히 쓰는 CE loss
 
@@ -256,15 +258,26 @@ def train_loop(
 
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient 폭주 방지를 위해 클리핑
+            # Gradient clipping (리뷰 반영: grad_clip 파라미터 사용)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
 
             optim.step()
+            
+            # Learning rate scheduling (리뷰 반영)
+            if scheduler is not None:
+                scheduler.step()
 
             optim.zero_grad()
 
             step += 1
 
-            wandb.log({"train/loss": loss.item(), "step": step})
+            # Log learning rate if scheduler is used
+            current_lr = optim.param_groups[0]['lr']
+            wandb.log({
+                "train/loss": loss.item(), 
+                "train/lr": current_lr,
+                "step": step
+            })
 
             # --------------------------------------------------------------
 
@@ -452,18 +465,13 @@ def main():
 
     # Train Dataset, 자세한 설정은 dataloader.py를 참고하세요.
 
+    # 리뷰 반영: 새로운 dataloader 사용
     train_dataset = ArithmeticDataset(
-
-        num_samples=500_000,
-
-        max_depth=3,
-
-        num_digits=(1, 5),
-
+        num_samples=200_000,  # 리뷰 반영: 적당한 샘플 수
+        phase=4,  # Phase 4: 4-5자리
         seed=123,
-
         mode="train",
-
+        enable_augmentation=True,
     )
 
     # Train DataLoader, 자세한 설정은 dataloader.py를 참고하세요.
@@ -483,17 +491,11 @@ def main():
     # Validation Dataset, 자세한 설정은 dataloader.py를 참고하세요.
 
     val_dataset = ArithmeticDataset(
-
-        num_samples=128,
-
-        max_depth=4,
-
-        num_digits=(1, 5),
-
+        num_samples=1000,  # 검증 샘플 수 증가
+        phase=4,
         seed=999,
-
         mode="val",
-
+        enable_augmentation=False,  # 검증에서는 증강 비활성화
     )
 
     # Validation DataLoader, 자세한 설정은 dataloader.py를 참고하세요.
@@ -606,38 +608,28 @@ def main():
 
     #-----------------------------
 
+    # 리뷰 반영: 기본값 업데이트
     model_config = ModelConfig(
-
-        d_model=256,
-
-        n_head=4,
-
+        d_model=384,  # 리뷰 반영: 384
+        nhead=6,  # 리뷰 반영: 6
         num_encoder_layers=4,
-
         num_decoder_layers=4,
-
-        dim_feedforward=512,
-
+        dim_feedforward=1536,  # 리뷰 반영: 4×384=1536
         dropout=0.1,
-
     )
 
     train_config = TrainConfig(
-
         max_train_steps=None,
-
-        lr=2e-3,
-
+        lr=1e-3,  # 리뷰 반영: 1e-3
+        warmup_steps=5000,  # 리뷰 반영: warmup 5k
+        weight_decay=0.1,  # 리뷰 반영: weight decay 0.1
+        grad_clip=1.0,  # 리뷰 반영: grad clip 1.0
         valid_every=200,
-
-        max_gen_len=24,
-
+        max_gen_len=50,  # 리뷰 반영: 50
         show_valid_samples=5,
-
         num_epochs=10,
-
         save_best_path="best_model.pt",
-
+        use_cosine_schedule=True,  # 리뷰 반영: cosine decay
     )
 
     # --------------------------------------------------------------------------
@@ -725,17 +717,11 @@ def train_run():
         # ----------------------------------------------------------------------
 
         train_dataset = ArithmeticDataset(
-
-            num_samples=500_000,
-
-            max_depth=cfg.max_depth_train,
-
-            num_digits=(1, 5),
-
+            num_samples=200_000,  # 리뷰 반영: 적당한 샘플 수
+            phase=cfg.get("phase", 4),  # 리뷰 반영: phase 기반
             seed=123,
-
             mode="train",
-
+            enable_augmentation=True,
         )
 
         train_dataloader = get_dataloader(
@@ -751,17 +737,11 @@ def train_run():
         )
 
         val_dataset = ArithmeticDataset(
-
-            num_samples=128,
-
-            max_depth=cfg.max_depth_val,
-
-            num_digits=(1, 5),
-
+            num_samples=1000,  # 검증 샘플 수 증가
+            phase=cfg.get("phase", 4),
             seed=999,
-
             mode="val",
-
+            enable_augmentation=False,  # 검증에서는 증강 비활성화
         )
 
         val_dataloader = get_dataloader(
@@ -837,21 +817,17 @@ def train_run():
         # ----------------------------------------------------------------------
 
         train_config = TrainConfig(
-
-            max_train_steps=None,     # 원하면 이걸도 sweep에 넣어도 됨
-
+            max_train_steps=None,
             lr=cfg.lr,
-
+            warmup_steps=5000,  # 리뷰 반영: warmup 5k steps
+            weight_decay=0.1,  # 리뷰 반영: weight decay 0.1
+            grad_clip=1.0,  # 리뷰 반영: grad clip 1.0
             valid_every=200,
-
-            max_gen_len=24,
-
+            max_gen_len=50,  # 리뷰 반영: max_gen_len 50
             show_valid_samples=5,
-
             num_epochs=10,
-
-            save_best_path="best_model.pt",  # run마다 다르게 하고 싶으면 f"best_{wandb.run.name}.pt" 등으로
-
+            save_best_path=f"best_{wandb.run.name}.pt" if wandb.run else "best_model.pt",
+            use_cosine_schedule=True,  # 리뷰 반영: cosine decay
         )
 
         # ----------------------------------------------------------------------
