@@ -320,26 +320,38 @@ def augment_with_parentheses(
     max_augmentations: int = 3
 ) -> List[str]:
     """
-    Generate variations with added parentheses.
-    Developer log: Parentheses augmentation for precedence learning.
+    Generate variations with SAFE parentheses addition.
+    Developer log: Only add parentheses when it doesn't change the value.
+    Returns list of (expr, value) tuples if value changes, otherwise just expressions.
     """
     if '(' in expression or ')' in expression:
         return []
     
     tokens = _parse_expression(expression)
-    subexprs = _find_subexpressions(tokens)
     
-    if not subexprs:
-        return []
+    # Check if only single operator type (safe to add parentheses)
+    operators = [t for t in tokens if t in ['+', '-', '*', '//']]
     
-    augmented = []
-    for start, end in subexprs[:max_augmentations]:
-        new_tokens = tokens[:start] + ['('] + tokens[start:end+1] + [')'] + tokens[end+1:]
-        new_expr = ''.join(new_tokens)
-        if new_expr != expression:
-            augmented.append(new_expr)
+    # Only allow parentheses for associative operations (+, *)
+    # Subtraction and division are NOT associative
+    if operators:
+        first_op = operators[0]
+        # Safe if all operators are same and associative
+        if first_op in ['+', '*'] and all(op == first_op for op in operators):
+            # Safe to add parentheses anywhere
+            subexprs = _find_subexpressions(tokens)
+            
+            augmented = []
+            for start, end in subexprs[:max_augmentations]:
+                new_tokens = tokens[:start] + ['('] + tokens[start:end+1] + [')'] + tokens[end+1:]
+                new_expr = ''.join(new_tokens)
+                if new_expr != expression:
+                    augmented.append(new_expr)
+            
+            return augmented
     
-    return augmented
+    # Unsafe to add parentheses (mixed operators or non-associative)
+    return []
 
 
 def augment_with_commutative_advanced(expression: str) -> List[str]:
@@ -1140,6 +1152,25 @@ class ArithmeticDataset(Dataset):
                 augmented = _safe_augment_expression(expr, val, rng)
                 if augmented:
                     expr, val = augmented
+        
+        # CRITICAL: Recompute target to ensure correctness (fixes operator precedence bugs)
+        # Developer log: Original generators use sequential calculation, but expressions follow precedence
+        try:
+            actual_value = eval(expr.replace('//', '//'))
+            if actual_value < 0:
+                # Regenerate if negative result
+                # Fallback to simple expression
+                a = _rand_int(rng, (1, digit_len))
+                b = _rand_int(rng, (1, digit_len))
+                expr = f"{a}+{b}"
+                actual_value = a + b
+            val = actual_value
+        except:
+            # If eval fails, fallback to simple expression
+            a = _rand_int(rng, (1, digit_len))
+            b = _rand_int(rng, (1, digit_len))
+            expr = f"{a}+{b}"
+            val = a + b
 
         return {
             "input_text": expr,
@@ -1158,6 +1189,7 @@ def create_augmented_dataset_from_original(original_dataset: Dataset) -> List[Di
     Create augmented dataset with group_id for EC learning.
     Developer log: Generates expression pairs from original dataset for Expression Consistency.
     Returns original + augmented samples with group_id field.
+    Validates mathematical correctness by recomputing all values.
     """
     augmented_data = []
     
@@ -1168,11 +1200,20 @@ def create_augmented_dataset_from_original(original_dataset: Dataset) -> List[Di
         expr = original_item["input_text"]
         target = original_item["target_text"]
         
-        # Validate original
+        # Validate original - recompute to ensure correctness
         target_str = str(target)
         if not (len(target_str) > 0 and target_str.isdigit()):
             continue
         if not _has_balanced_parentheses(expr):
+            continue
+        
+        # CRITICAL: Recompute original expression to verify correctness
+        try:
+            actual_value = eval(expr.replace('//', '//'))
+            if str(actual_value) != target_str or actual_value < 0:
+                # Skip if mismatch or negative
+                continue
+        except:
             continue
         
         # Group ID for EC learning
@@ -1208,6 +1249,15 @@ def create_augmented_dataset_from_original(original_dataset: Dataset) -> List[Di
             if not (len(new_target_str) > 0 and new_target_str.isdigit()):
                 continue
             if not _has_balanced_parentheses(expr_str):
+                continue
+            
+            # CRITICAL: Recompute augmented expression to verify correctness
+            try:
+                actual_aug_value = eval(expr_str.replace('//', '//'))
+                if str(actual_aug_value) != new_target_str or actual_aug_value < 0:
+                    # Skip if mismatch or negative
+                    continue
+            except:
                 continue
             
             aug_item = {
