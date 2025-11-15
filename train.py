@@ -933,7 +933,7 @@ def train_loop(
                             }
                             torch.save(ckpt, train_config.save_best_path)
                             pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
-                    
+
                     # Early stopping 체크 (wandb sweep용)
                     should_stop = False
                     stop_reason = ""
@@ -1668,9 +1668,9 @@ def train_run():
 # python train.py로 실행했을 때만 main()을 돌게 합니다.
 
 if __name__ == "__main__":
+    # 단일 실행 (main 함수 사용)
+    # main()
 
-    main()
-
-    #sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
-
-    #wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)
+    # Sweep 실행 (하이퍼파라미터 탐색)
+    sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
+    wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)
