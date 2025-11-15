@@ -140,16 +140,18 @@ teacher_forcing_ratio = 0.9 # 초기값, 점진적 감소
 - **목적**: 인픽스 수식을 직접 바꾸지 않고, 학습 과정에서만 RPN(Reverse Polish Notation) 시퀀스를 예측하도록 하여 연산 우선순위/괄호 패턴에 대한 일반화를 강화.
 - **구성**
   - Encoder는 depth profile(`baseline`, `LEGACY_POWERUP`, `DEEP_CONTEXT`, `ULTRA_CONTEXT`)로 확장된 Transformer를 그대로 사용.
-  - Result decoder와 동일한 depth를 갖는 **보조 디코더**를 추가하고, 동일한 char vocab을 사용해 RPN 문자열을 생성.
+  - Result decoder와 동일한 depth를 갖는 **보조 디코더**를 추가하고, **전용 임베딩/출력층(`rpn_vocab`)**을 사용해 연산자/공백을 안전하게 처리.
   - Inference(`predict()`)에서는 기존 경로만 사용하므로 제출 규칙에 영향을 주지 않음.
 - **학습**
   - `loss = CE(result) + λ_rpn * CE(rpn)` 형태의 joint loss.
-  - `TrainConfig.lambda_rpn` (기본 0.2)로 보조 loss 비중 조절.
-  - Batch별로 infix → RPN 변환 후 BOS/EOS를 붙여 입력/정답 시퀀스를 구성.
+  - `TrainConfig.lambda_rpn` (기본 0.2)로 보조 loss 비중 조절 (`λ_rpn > 0`일 때만 RPN head 생성).
+  - Batch별로 infix → RPN 변환 후 BOS/EOS를 붙여 입력/정답 시퀀스를 구성. `//` 연산은 문자 `D`로 매핑하여 char-level 토크나이저와 호환.
+  - `_encode_rpn_text()` 유틸로 RPN 토큰에 허용되지 않은 문자가 포함되면 즉시 예외를 발생시켜 디버깅을 돕는다.
   - Batch size 128, `train_num_samples=900k`, `train_phase_mix=(2,3,4)` 설정과 함께 사용하면 장·복합 수식에서 안정적인 수렴 확인.
 - **주의**
-  - 기존 `best_model.pt`를 strict=False로 로드하여 RPN head 및 추가 디코더 레이어 파라미터를 새로 초기화해야 함.
-  - RPN 토크나이저는 학습 시에만 사용하며, 공백/연산자를 포함하도록 별도로 구성.
+  - 기존 `best_model.pt`는 `strict=False` 로 자동 로딩되며, RPN 임베딩/디코더 키는 새로 초기화된다.
+  - RPN 토크나이저는 학습 시에만 사용하며, 허용 문자 집합은 `{0-9, 공백, +, -, *, D}`로 고정된다.
+  - Infix 입력은 절대 변형하지 않으며, RPN은 오직 auxiliary loss를 위한 타깃일 뿐이다.
 
 ### 2. Scheduled Sampling
 

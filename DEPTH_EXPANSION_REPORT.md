@@ -60,9 +60,10 @@
 
 - **장점**
   - 동일 encoder representation을 공유하면서, 연산 순서를 명시적으로 학습해 긴 연산/괄호 조합의 일반화를 개선할 가능성이 높음.
-  - depth_profile로 늘어난 디코더 용량을 RPN head에도 재사용하므로 파라미터 증가가 제한적 (projection 한 층 추가 수준).
+  - depth_profile로 늘어난 디코더 용량을 RPN head에도 재사용하되, 전용 임베딩/출력(`rpn_vocab`)을 둬서 digits/연산자 vocab을 안전하게 분리.
   - inference 경로는 기존 `generate()`/`predict()`를 그대로 사용하므로 제출 규칙을 위반하지 않음.
 - **위험/대응**
-  - best_model 기반 strict 로딩 시 새 디코더 레이어와 RPN head는 새로 초기화되므로, 초기 수렴을 위해 λ 조절이 필수 → 기본값 0.2 제안.
-  - RPN 타깃 생성 로직(infix→RPN)이 오류를 내면 전체 학습이 망가지므로, 괄호/나눗셈 처리, 연속 숫자 파싱 등을 유닛 테스트로 검증해야 함.
+  - best_model 기반 strict 로딩 시 새 디코더 레이어와 RPN head는 새로 초기화되므로, 초기 수렴을 위해 λ 조절이 필수 → 기본값 0.2 제안. (코드에서 자동으로 `strict=False` 로드 & missing-key 로그 출력)
+  - RPN 타깃 생성 로직(infix→RPN)이 오류를 내면 전체 학습이 망가지므로, 괄호/나눗셈 처리, 연속 숫자 파싱 등을 `_safe_infix_to_rpn` + `_encode_rpn_text`로 검증.
+  - `//`는 토크나이저에서 단일 문자 `D`로 매핑되므로, RPN 문자 집합 `{0-9, 공백, +, -, *, D}` 유지 여부를 확인해야 함.
   - 학습 메모리 사용량이 증가하므로 batch size 128 유지 권장. 필요 시 GradAccum 옵션 대비.

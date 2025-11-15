@@ -8,16 +8,16 @@
 - `TrainConfig`에 depth_profile, train_num_samples, val_num_samples, train_phase_mix, val_phase 추가
 
 ### 2. **model.py** ⭐ 필수
-- `TransformerSeq2Seq`에 RPN 디코더 추가 (`self.rpn_decoder`, `self.rpn_out`)
-- `forward_with_rpn()` 메서드 추가 (훈련 시 RPN 보조 학습용)
+- `TransformerSeq2Seq`에 RPN 디코더 + 전용 임베딩/출력(`self.rpn_embed`, `self.rpn_out`) 추가
+- `forward_with_rpn()` 메서드 추가 (훈련 시 RPN 보조 학습용; `rpn_vocab` 없으면 예외)
 - 기존 `forward()`, `generate()`, `Model.predict()`는 그대로 유지 (추론 경로 변경 없음)
 
 ### 3. **train.py** ⭐ 필수
 - `infix_to_rpn()` 함수 추가 (infix → RPN 변환)
 - `build_rpn_tokenizer()` 함수 추가 (RPN용 토크나이저 생성)
-- `_pad_sequences()` 함수 추가 (RPN 시퀀스 패딩)
+- `_encode_rpn_text()` / `_pad_sequences()` 유틸 추가 (문자 집합 검증 + 패딩)
 - `train_loop()`에 RPN 학습 로직 추가 (joint loss: `loss + lambda_rpn * loss_rpn`)
-- `main()` 및 `train_run()`에서 RPN 토크나이저 생성 및 전달
+- `main()` 및 `train_run()`에서 RPN 토크나이저 생성 + `rpn_vocab` 전달
 
 ### 4. **dataloader.py** ⭐ 필수
 - `long_expression` 카테고리 추가 (10%)
@@ -76,7 +76,7 @@ rpn_tokenizer = None  # build_rpn_tokenizer() 대신 None
 
 ### 체크포인트 호환성
 - 기존 `best_model.pt` (d_model=256, nhead=2)는 **호환됨**
-- RPN 디코더는 새로 초기화되므로 `load_state_dict(strict=False)` 사용
+- RPN 디코더/임베딩은 새로 초기화되므로 자동으로 `strict=False` 로드 (로그에 missing key 안내)
 - depth_profile로 layer 수를 늘리면 추가 layer만 새로 초기화됨
 
 ### 메모리 사용량
@@ -86,6 +86,7 @@ rpn_tokenizer = None  # build_rpn_tokenizer() 대신 None
 ### 학습 설정
 - 기본값: `lambda_rpn = 0.2` (RPN loss 가중치)
 - `lambda_rpn = 0.0`으로 설정하면 RPN 비활성화 (기존 모델과 동일)
+- `lambda_rpn > 0`일 때만 RPN 디코더/임베딩이 활성화되며, 토크나이저는 {0-9, 공백, +, -, *, D}만 사용
 
 ---
 
@@ -95,7 +96,7 @@ rpn_tokenizer = None  # build_rpn_tokenizer() 대신 None
 |------|-------------|
 | **config.py** | `lambda_rpn`, depth_profile, 대규모 데이터셋 설정 추가 |
 | **model.py** | RPN 디코더 + `forward_with_rpn()` 추가 |
-| **train.py** | RPN 타깃 생성 + joint loss 학습 로직 추가 |
+| **train.py** | RPN 타깃 생성 + joint loss + 안전한 토큰 검증 추가 |
 | **dataloader.py** | long_expression, complex_nested 카테고리 추가 |
 
 ---

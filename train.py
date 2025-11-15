@@ -78,6 +78,19 @@ def build_rpn_tokenizer(tokenizer_config: TokenizerConfig) -> CharTokenizer:
     return CharTokenizer(merged_chars, add_special=tokenizer_config.add_special)
 
 
+def _encode_rpn_text(tokenizer: CharTokenizer, text: str) -> List[int]:
+    """
+    Helper for safer RPN encoding with clearer error messages.
+    """
+    try:
+        return tokenizer.encode(text, add_bos_eos=False)
+    except ValueError as exc:
+        unknown_chars = sorted({ch for ch in set(text) if ch not in tokenizer.stoi})
+        raise ValueError(
+            f"RPN tokenizer missing chars {unknown_chars} for text '{text}'"
+        ) from exc
+
+
 def _pad_sequences(seqs: List[List[int]], pad_id: int) -> torch.Tensor:
     max_len = max(len(s) for s in seqs) if seqs else 1
     padded = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
@@ -285,7 +298,11 @@ def train_loop(
     # pad 토큰은 무시하도록(ignore_index) 설정
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=output_tokenizer.pad_id)
-    use_rpn_head = rpn_tokenizer is not None and hasattr(model, "forward_with_rpn")
+    use_rpn_head = (
+        rpn_tokenizer is not None
+        and hasattr(model, "forward_with_rpn")
+        and train_config.lambda_rpn > 0
+    )
     loss_fn_rpn = (
         nn.CrossEntropyLoss(ignore_index=rpn_tokenizer.pad_id)
         if use_rpn_head and rpn_tokenizer is not None
@@ -374,7 +391,7 @@ def train_loop(
                 for expr in batch["input_text"]:
                     tokens = _safe_infix_to_rpn(expr)
                     rpn_text = " ".join(tokens)
-                    ids_body = rpn_tokenizer.encode(rpn_text, add_bos_eos=False)
+                    ids_body = _encode_rpn_text(rpn_tokenizer, rpn_text)
                     rpn_inp_ids.append([rpn_tokenizer.bos_id] + ids_body)
                     rpn_out_ids.append(ids_body + [rpn_tokenizer.eos_id])
 
@@ -883,13 +900,18 @@ def main():
 
     # )
 
+    rpn_vocab = (
+        rpn_tokenizer.vocab_size
+        if rpn_tokenizer is not None and train_config.lambda_rpn > 0
+        else None
+    )
+
     model = TransformerSeq2Seq(
-
-    in_vocab=input_tokenizer.vocab_size,
-
-    out_vocab=output_tokenizer.vocab_size,
-
-     **model_config.__dict__,)
+        in_vocab=input_tokenizer.vocab_size,
+        out_vocab=output_tokenizer.vocab_size,
+        rpn_vocab=rpn_vocab,
+        **model_config.__dict__,
+    )
 
     # --------------------------------------------------------------------------
     # 체크포인트 로드 (Resume training with compatibility check)
@@ -934,20 +956,25 @@ def main():
                     if not is_match:
                         config_match = False
             
+            state_dict = checkpoint["model_state"]
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            missing_keys = incompatible.missing_keys
+            unexpected_keys = incompatible.unexpected_keys
+
             if config_match:
-                # 설정이 일치하는 경우: 체크포인트에서 로드
-                model.load_state_dict(checkpoint["model_state"])
-                print("\n✅ Configuration matches! Model weights loaded successfully")
-                if "step" in checkpoint:
-                    print(f"📊 Resuming from step: {checkpoint['step']}")
+                print("\n✅ Configuration matches! Model weights loaded successfully.")
             else:
-                # 설정이 다른 경우: 새로 학습 시작
                 print("\n⚠️  Model configuration mismatch detected!")
-                print("   Current model is LARGER than checkpoint model.")
-                print("   🚀 Starting training from scratch with A100-optimized model.")
-                print("\n💡 To use the old checkpoint, change ModelConfig back to:")
-                for key, val in OLD_MODEL_CONFIG.items():
-                    print(f"     {key}: {val}")
+                print("   Current model depth differs from checkpoint (expected for depth_profile).")
+                print("   Missing keys will be randomly initialized; training will fine-tune them.")
+
+            if missing_keys:
+                print(f"   ℹ️ Missing keys ({len(missing_keys)}): {missing_keys[:8]}{' ...' if len(missing_keys) > 8 else ''}")
+            if unexpected_keys:
+                print(f"   ℹ️ Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:8]}{' ...' if len(unexpected_keys) > 8 else ''}")
+
+            if "step" in checkpoint:
+                print(f"📊 Resuming from step: {checkpoint['step']}")
             
             print("=" * 70)
             print()
@@ -1117,9 +1144,16 @@ def train_run():
             mode="val",
         )
 
+        rpn_vocab = (
+            rpn_tokenizer.vocab_size
+            if rpn_tokenizer is not None and train_config.lambda_rpn > 0
+            else None
+        )
+
         model = TransformerSeq2Seq(
             in_vocab=input_tokenizer.vocab_size,
             out_vocab=output_tokenizer.vocab_size,
+            rpn_vocab=rpn_vocab,
             **model_config.__dict__,
         )
 

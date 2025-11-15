@@ -440,9 +440,11 @@ class TransformerSeq2Seq(nn.Module):
         num_decoder_layers = kwargs.get("num_decoder_layers", 4)
         dim_feedforward = kwargs.get("dim_feedforward", 512)
         dropout = kwargs.get("dropout", 0.1)
+        rpn_vocab = kwargs.get("rpn_vocab")
         self.d_model = d_model
         self.in_vocab = in_vocab
         self.out_vocab = out_vocab
+        self.rpn_vocab = rpn_vocab
 
         # 임베딩
         self.embed_in = nn.Embedding(in_vocab, d_model)
@@ -474,16 +476,22 @@ class TransformerSeq2Seq(nn.Module):
         # 출력 projection
         self.out_proj = nn.Linear(d_model, out_vocab)
 
-        # RPN auxiliary decoder/projection (훈련 전용)
-        rpn_decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.rpn_decoder = nn.TransformerDecoder(rpn_decoder_layer, num_layers=num_decoder_layers)
-        self.rpn_out = nn.Linear(d_model, out_vocab)
+        # RPN auxiliary decoder/projection (훈련 전용, optional)
+        if rpn_vocab is not None:
+            rpn_decoder_layer = nn.TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.rpn_decoder = nn.TransformerDecoder(rpn_decoder_layer, num_layers=num_decoder_layers)
+            self.rpn_embed = nn.Embedding(rpn_vocab, d_model)
+            self.rpn_out = nn.Linear(d_model, rpn_vocab)
+        else:
+            self.rpn_decoder = None
+            self.rpn_embed = None
+            self.rpn_out = None
 
     def forward(
         self,
@@ -544,6 +552,8 @@ class TransformerSeq2Seq(nn.Module):
             result_logits: [B, T_res, out_vocab]
             rpn_logits   : [B, T_rpn, out_vocab]
         """
+        if self.rpn_decoder is None or self.rpn_embed is None or self.rpn_out is None:
+            raise RuntimeError("RPN head is not initialized; pass rpn_vocab when constructing the model.")
         device = src.device
         B, S = src.size()
         _, T_result = tgt_result_inp.size()
@@ -571,7 +581,7 @@ class TransformerSeq2Seq(nn.Module):
         result_logits = self.out_proj(res_out)
 
         # --- RPN decoder (훈련 전용) ---
-        rpn_emb = self.embed_out(rpn_inp) * math.sqrt(self.d_model)
+        rpn_emb = self.rpn_embed(rpn_inp) * math.sqrt(self.d_model)
         rpn_emb = self.pos_enc_out(rpn_emb)
         rpn_mask = _generate_square_subsequent_mask(T_rpn, device=device)
         rpn_out = self.rpn_decoder(
