@@ -35,6 +35,15 @@ OUTPUT_6DIGIT_RATIO = {
     "single_number": 0.0,
 }
 
+# Phase-based augmentation probability (리뷰 반영: Phase별 증강 비율 조정)
+# Phase 1-2: 낮은 증강 (기본기 안정화), Phase 3: 높은 증강, Phase 4: 중간 증강
+PHASE_AUGMENTATION_PROB = {
+    1: 0.05,  # Phase 1: 5% (기본기 안정화)
+    2: 0.10,  # Phase 2: 10%
+    3: 0.25,  # Phase 3: 25% (증강 강화)
+    4: 0.15,  # Phase 4: 15% (상기 정도)
+}
+
 
 def _rand_int(rng: random.Random, num_digits: Tuple[int, int]) -> int:
     """Generate random integer with specified digit range (no leading zeros)"""
@@ -373,8 +382,9 @@ class ArithmeticDataset(Dataset):
             expr, val = _gen_precedence(rng, digit_len, force_6digit)
         elif category == "expression_consistency":
             expr, val = _gen_expression_consistency_base(rng, digit_len, force_6digit)
-            # Apply augmentation with 50% probability
-            if self.enable_augmentation and rng.random() < 0.5:
+            # Apply augmentation with phase-based probability (리뷰 반영)
+            augment_prob = PHASE_AUGMENTATION_PROB.get(self.phase, 0.15)  # default 15%
+            if self.enable_augmentation and rng.random() < augment_prob:
                 augmented = _safe_augment_expression(expr, val, rng)
                 if augmented is not None:
                     expr, val = augmented
