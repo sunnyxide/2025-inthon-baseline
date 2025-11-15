@@ -8,6 +8,8 @@ import torch
 
 import torch.nn as nn
 
+import math
+
 from do_not_edit.model_template import BaseModel
 
 # ========================
@@ -378,6 +380,209 @@ class TinySeq2Seq(nn.Module):
         return torch.empty((B, 0), dtype=torch.long, device=src.device)
 
 
+class PositionalEncoding(nn.Module):
+    """
+    표준 sin/cos 위치 인코딩.
+    입력: [B, T, d_model]
+    출력: [B, T, d_model] (positional encoding이 더해진 결과)
+    """
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        pe = torch.zeros(max_len, d_model)  # [T, d_model]
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [T, 1]
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)   # 짝수 차원
+        pe[:, 1::2] = torch.cos(position * div_term)   # 홀수 차원
+        pe = pe.unsqueeze(0)  # [1, T, d_model]
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, d_model]
+        """
+        T = x.size(1)
+        x = x + self.pe[:, :T, :]
+        return self.dropout(x)
+
+
+def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
+    """
+    디코더용 causal mask (각 위치가 이전 토큰까지만 볼 수 있도록).
+    반환: [T, T] float 텐서 (masked 위치는 -inf, 나머지는 0)
+    """
+    mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)  # 상삼각(대각선 위) = 1
+    mask = mask.masked_fill(mask == 1, float("-inf"))  # 가려야 할 곳은 -inf
+    mask = mask.masked_fill(mask == 0, 0.0)            # 나머지는 0
+    return mask
+
+
+class TransformerSeq2Seq(nn.Module):
+    """
+    문자 단위 Transformer 기반 Seq2Seq 모델.
+    - 인코더: TransformerEncoder
+    - 디코더: TransformerDecoder
+    - forward:
+        src  : [B, S]
+        tgt_inp : [B, T] (BOS + target tokens)
+        -> logits: [B, T, out_vocab]
+    - generate:
+        src  : [B, S]
+        -> greedy decoding으로 [B, T'] 생성
+    """
+    def __init__(self, in_vocab: int, out_vocab: int, **kwargs):
+        super().__init__()
+        # 기본 하이퍼파라미터 설정 (model_config_dict에서 override 가능)
+        d_model = kwargs.get("d_model", 256)
+        nhead = kwargs.get("nhead", 4)
+        num_encoder_layers = kwargs.get("num_encoder_layers", 4)
+        num_decoder_layers = kwargs.get("num_decoder_layers", 4)
+        dim_feedforward = kwargs.get("dim_feedforward", 512)
+        dropout = kwargs.get("dropout", 0.1)
+        self.d_model = d_model
+        self.in_vocab = in_vocab
+        self.out_vocab = out_vocab
+
+        # 임베딩
+        self.embed_in = nn.Embedding(in_vocab, d_model)
+        self.embed_out = nn.Embedding(out_vocab, d_model)
+
+        # 위치 인코딩
+        self.pos_enc_in = PositionalEncoding(d_model, dropout)
+        self.pos_enc_out = PositionalEncoding(d_model, dropout)
+
+        # 인코더 / 디코더 레이어 정의 (batch_first=True로 [B, T, C] 사용)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+
+        # 출력 projection
+        self.out_proj = nn.Linear(d_model, out_vocab)
+
+    def forward(
+        self,
+        src: torch.Tensor,       # [B, S]
+        tgt_inp: torch.Tensor,   # [B, T]
+        src_pad_id: int,
+        teacher_forcing: float = 1.0,  # 현재는 항상 teacher forcing 1.0 (GRU 버전과 동일)
+    ) -> torch.Tensor:
+        """
+        학습 시 순전파.
+        반환: logits [B, T, out_vocab]
+        """
+        device = src.device
+        B, S = src.size()
+        _, T = tgt_inp.size()
+
+        # --- Encoder ---
+        src_emb = self.embed_in(src) * math.sqrt(self.d_model)  # [B, S, d_model]
+        src_emb = self.pos_enc_in(src_emb)                      # 위치 인코딩 추가
+
+        # 소스 패딩 마스크 (True = 패딩임)
+        src_key_padding_mask = (src == src_pad_id)  # [B, S], bool
+
+        # 인코더 출력 (memory)
+        memory = self.encoder(
+            src_emb,
+            src_key_padding_mask=src_key_padding_mask,
+        )  # [B, S, d_model]
+
+        # --- Decoder ---
+        tgt_emb = self.embed_out(tgt_inp) * math.sqrt(self.d_model)  # [B, T, d_model]
+        tgt_emb = self.pos_enc_out(tgt_emb)
+
+        # causal mask: 디코더가 미래 토큰을 못 보도록
+        tgt_mask = _generate_square_subsequent_mask(T, device=device)  # [T, T]
+
+        # (단순화 위해 tgt_key_padding_mask는 사용하지 않음: GRU 버전과 일관되게)
+        dec_out = self.decoder(
+            tgt_emb,           # [B, T, d_model]
+            memory,            # [B, S, d_model]
+            tgt_mask=tgt_mask, # [T, T]
+            memory_key_padding_mask=src_key_padding_mask,
+        )  # [B, T, d_model]
+
+        logits = self.out_proj(dec_out)  # [B, T, out_vocab]
+        return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        src: torch.Tensor,   # [B, S]
+        max_len: int,
+        bos_id: int,
+        eos_id: int,
+        src_pad_id: int,
+    ) -> torch.Tensor:
+        """
+        추론 시 greedy decoding.
+        반환: [B, T'] (EOS 나오면 중단, 아니면 max_len까지)
+        """
+        device = src.device
+        B, S = src.size()
+
+        # --- Encoder ---
+        src_emb = self.embed_in(src) * math.sqrt(self.d_model)    # [B, S, d_model]
+        src_emb = self.pos_enc_in(src_emb)
+        src_key_padding_mask = (src == src_pad_id)                # [B, S]
+        memory = self.encoder(
+            src_emb,
+            src_key_padding_mask=src_key_padding_mask,
+        )  # [B, S, d_model]
+
+        # 디코더 입력 시작: BOS
+        y = torch.full((B, 1), bos_id, dtype=torch.long, device=device)  # [B, 1]
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        outputs = []
+
+        for _ in range(max_len):
+            T = y.size(1)
+            tgt_emb = self.embed_out(y) * math.sqrt(self.d_model)  # [B, T, d_model]
+            tgt_emb = self.pos_enc_out(tgt_emb)
+            tgt_mask = _generate_square_subsequent_mask(T, device=device)  # [T, T]
+
+            dec_out = self.decoder(
+                tgt_emb,       # [B, T, d_model]
+                memory,        # [B, S, d_model]
+                tgt_mask=tgt_mask,
+                memory_key_padding_mask=src_key_padding_mask,
+            )  # [B, T, d_model]
+
+            last_step = dec_out[:, -1, :]        # [B, d_model]
+            logits = self.out_proj(last_step)    # [B, out_vocab]
+            next_id = torch.argmax(logits, dim=-1)  # [B]
+            outputs.append(next_id)
+
+            # y에 토큰 추가
+            y = torch.cat([y, next_id.unsqueeze(1)], dim=1)  # [B, T+1]
+
+            # EOS가 나온 샘플은 finished 표시
+            finished = finished | (next_id == eos_id)
+
+            # 모든 샘플이 EOS를 낸 경우 종료
+            if torch.all(finished):
+                break
+
+        if outputs:
+            return torch.stack(outputs, dim=1)  # [B, gen_len]
+        return torch.empty((B, 0), dtype=torch.long, device=device)
+
+
 # ========================
 # InThon 규정용 Model
 # ========================
@@ -444,11 +649,18 @@ class Model(BaseModel):
             raise ValueError(f"체크포인트에 'model_config'가 없습니다.")
         
         # TinySeq2Seq 모델 인스턴스 생성 (체크포인트에서 로드한 설정을 **kwargs로 전달)
-        self.model = TinySeq2Seq(
-            in_vocab=self.input_tokenizer.vocab_size,  # 입력 vocab 크기
-            out_vocab=self.output_tokenizer.vocab_size,  # 출력 vocab 크기
-            **model_config_dict,  # 모델 설정을 **kwargs로 전달
-        ).to(self.device)  # 지정된 디바이스로 이동
+        # self.model = TinySeq2Seq(
+        #     in_vocab=self.input_tokenizer.vocab_size,  # 입력 vocab 크기
+        #     out_vocab=self.output_tokenizer.vocab_size,  # 출력 vocab 크기
+        #     **model_config_dict,  # 모델 설정을 **kwargs로 전달
+        # ).to(self.device)  # 지정된 디바이스로 이동
+
+        #Transformer 모델 인스턴스
+        self.model = TransformerSeq2Seq(
+        in_vocab=self.input_tokenizer.vocab_size,
+        out_vocab=self.output_tokenizer.vocab_size,
+        **model_config_dict,
+        ).to(self.device)
         
         # 모델 가중치 로드
         model_state = checkpoint.get("model_state", checkpoint)
