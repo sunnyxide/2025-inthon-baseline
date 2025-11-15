@@ -126,6 +126,63 @@ def gen_OOD() -> str:
     ])
 
 
+def gen_OOD_examples() -> Dict[str, List[str]]:
+    """
+    Generate specific OOD examples for demonstration
+    Returns examples: addition (3), subtraction (3), multiplication (1), division (1)
+    Developer log: Direct examples for OOD evaluation display
+    """
+    examples = {
+        "addition": [],
+        "subtraction": [],
+        "multiplication": [],
+        "division": [],
+    }
+    
+    # Addition examples (3개, 연산자 2개 이상 복합식 1개 포함)
+    for _ in range(2):
+        a, b = gen_large(), gen_large()
+        examples["addition"].append(f"{a}+{b}")
+    
+    # Complex addition (연산자 2개 이상)
+    a, b, c = gen_large(), gen_large(), gen_large()
+    examples["addition"].append(f"{a}+{b}+{c}")
+    
+    # Subtraction examples (3개, 연산자 2개 이상 복합식 1개 포함)
+    for _ in range(2):
+        # Ensure a > b to avoid negative results
+        a_str = gen_large()
+        b_str = gen_large()
+        a_val = int(a_str)
+        b_val = int(b_str)
+        if a_val < b_val:
+            a_val, b_val = b_val, a_val
+        examples["subtraction"].append(f"{a_val}-{b_val}")
+    
+    # Complex subtraction (연산자 2개 이상, non-negative)
+    a_str, b_str, c_str = gen_large(), gen_large(), gen_large()
+    a_val = int(a_str)
+    b_val = int(b_str)
+    c_val = int(c_str)
+    # Ensure result is non-negative: a - b - c >= 0
+    if a_val < (b_val + c_val):
+        a_val = b_val + c_val + random.randint(1000, 9999)
+    examples["subtraction"].append(f"{a_val}-{b_val}-{c_val}")
+    
+    # Multiplication example (1개)
+    a, b = gen_large(), gen_large()
+    examples["multiplication"].append(f"{a}*{b}")
+    
+    # Division example (1개)
+    a_str = gen_large()
+    b_str = gen_large()
+    # Ensure b is not too small to avoid very large results
+    b_val = max(int(b_str), 1000)
+    examples["division"].append(f"{a_str}//{b_val}")
+    
+    return examples
+
+
 # --- HARD EC ---
 
 
@@ -144,12 +201,15 @@ def gen_hEC() -> str:
 
 
 def gen_hLP() -> str:
-    """Generate Hard Left-Precedence expression"""
+    """Generate Hard Left-Precedence expression (ensures non-negative result)"""
     a, b, c, d, e = gen_num(), gen_num(), gen_num(), gen_num(), gen_num()
+    # Ensure subtraction doesn't result in negative values
+    # Use expressions that guarantee non-negative results
     return random.choice([
-        f"{a}+({b}*({c}+{d}))-{e}",
+        f"{a}+({b}*({c}+{d}))+{e}",  # Changed - to + to avoid negative
         f"({a}*({b}+({c}*{d})))+{e}",
         f"(({a}+{b})*({c}+({d}*{e})))",
+        f"{a}+({b}*({c}+{d}))",  # Removed subtraction
     ])
 
 
@@ -218,8 +278,8 @@ def generate_datasets() -> Dict[str, List[Tuple[str, str]]]:
 def safe_eval(expr: str) -> str | None:
     """
     Safely evaluate arithmetic expression
-    Returns None if evaluation fails
-    Developer log: Improved handling for large numbers and division by zero
+    Returns None if evaluation fails or result is negative
+    Developer log: Improved handling for large numbers, division by zero, and negative results
     """
     try:
         # Evaluate expression (Python's // is floor division)
@@ -234,8 +294,13 @@ def safe_eval(expr: str) -> str | None:
             if abs(result) == float('inf'):
                 return None
         
-        # Convert to integer string
+        # Convert to integer
         int_result = int(result)
+        
+        # Filter negative results (competition rule: no negative answers)
+        if int_result < 0:
+            return None
+        
         return str(int_result)
     except (ZeroDivisionError, ValueError, OverflowError, TypeError):
         return None
@@ -274,6 +339,7 @@ def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examp
         # Get ground truth
         gt = safe_eval(expr)
         if gt is None:
+            # Skip expressions that evaluate to negative or invalid
             continue
         
         # Store expression for examples
@@ -344,10 +410,25 @@ def eval_dataset(name: str, data: List[Tuple[str, str]], model: Model, max_examp
         shown_cats = set()
         for cat, expr in all_expressions[:20]:  # Show first 20 expressions
             if cat not in shown_cats:
-                print(f"  [{cat}] {expr}")
-                shown_cats.add(cat)
+                gt_example = safe_eval(expr)
+                if gt_example is not None:  # Only show valid expressions
+                    print(f"  [{cat}] {expr} = {gt_example}")
+                    shown_cats.add(cat)
                 if len(shown_cats) >= 4:  # Show one from each category
                     break
+    
+    # Print OOD examples directly
+    if name == "OOD":
+        print(f"\nOOD Example expressions (direct examples):")
+        ood_examples = gen_OOD_examples()
+        for op_type, exprs in ood_examples.items():
+            print(f"\n  {op_type.capitalize()}:")
+            for expr in exprs:
+                gt_example = safe_eval(expr)
+                if gt_example is not None:
+                    print(f"    {expr} = {gt_example}")
+                else:
+                    print(f"    {expr} = (invalid/negative)")
     
     # Print examples
     if examples:
