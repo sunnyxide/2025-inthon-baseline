@@ -72,7 +72,7 @@ class TrainConfig:
     valid_every: int = 200  # Validation frequency (legacy 설정)
     max_gen_len: int = 50  # Max generation length (문헌 권장: 50)
     show_valid_samples: int = 5  # legacy default
-    num_epochs: int = 20  # legacy (W&B 최적)
+    num_epochs: int = 10  # 20 → 10 (학습 시간 단축)
     batch_size: int = 128  # legacy baseline batch size
     save_best_path: Optional[str] = None
     use_cosine_schedule: bool = True  # Use cosine decay after warmup
