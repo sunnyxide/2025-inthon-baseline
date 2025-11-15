@@ -877,7 +877,9 @@ def train_loop(
                                 cat = meta.get("category", "unknown")
                             else:
                                 cat = "unknown"
-                            category_indices.setdefault(cat, []).append(idx)
+                            # Developer log: "unknown" 카테고리는 로깅에서 제외 (meta 정보 없는 샘플)
+                            if cat != "unknown":
+                                category_indices.setdefault(cat, []).append(idx)
                         
                         cat_log_payload: dict[str, float] = {}
                         for cat, idxs in category_indices.items():

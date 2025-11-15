@@ -1307,9 +1307,8 @@ def get_dataloader(
 ) -> DataLoader:
     """Create DataLoader with validation collate function."""
     is_training = getattr(dataset, "mode", mode) == "train"
-    collate_fn = (
-        partial(collate_fn_with_validation, is_training=True) if is_training else None
-    )
+    # Developer log: validation 모드에서도 collate_fn_with_validation 사용하여 meta 정보 보존
+    collate_fn = partial(collate_fn_with_validation, is_training=is_training)
     return DataLoader(
         dataset,
         batch_size=batch_size,
