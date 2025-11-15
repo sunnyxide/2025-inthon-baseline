@@ -2,15 +2,9 @@ from __future__ import annotations
 
 
 
-from typing import List, Any, Tuple, Optional
+from typing import List, Any, Tuple
 
-from config import (
-    TrainConfig,
-    ModelConfig,
-    TokenizerConfig,
-    DEPTH_PROFILES,
-    apply_depth_profile,
-)
+from config import TrainConfig, ModelConfig, TokenizerConfig
 
 import os
 
@@ -25,9 +19,16 @@ from tqdm import tqdm
 import wandb
 
 from dataloader import (
+
     ArithmeticDataset,  # 사칙연산 데이터를 만들어주는 Dataset
+
     get_dataloader,     # Dataset을 받아서 DataLoader로 바꿔주는 함수
+
 )
+
+# 고정된 validation 샘플 (전역 변수로 한 번만 생성)
+_FIXED_VAL_SAMPLES = None
+_FIXED_VAL_SAMPLES_INPUTS = None
 
 from do_not_edit.metric import compute_metrics  # EM, TES 같은 간단한 성능 지표
 
@@ -46,132 +47,6 @@ from model import (
     OUTPUT_CHARS,       # 출력 문자 집합
 
 )
-
-RPN_EXTRA_CHARS = [" ", "+", "-", "*", "D"]  # D는 // 연산자를 나타냄
-
-
-def _merge_chars(base_chars: List[str]) -> List[str]:
-    """
-    Merge base output chars with RPN operators.
-    Developer log: RPN tokenizer needs space + operators for "12 3 + 4 *" format.
-    """
-    seen = set()
-    merged: List[str] = []
-    for ch in base_chars + RPN_EXTRA_CHARS:
-        if ch not in seen:
-            merged.append(ch)
-            seen.add(ch)
-    return merged
-
-
-def build_rpn_tokenizer(tokenizer_config: TokenizerConfig) -> CharTokenizer:
-    """
-    Build RPN tokenizer with extended vocab (digits + space + operators).
-    Developer log: Supports char-level RPN encoding, avoiding multi-char token issues.
-    """
-    base_chars = (
-        tokenizer_config.output_chars
-        if tokenizer_config.output_chars is not None
-        else OUTPUT_CHARS
-    )
-    merged_chars = _merge_chars(list(base_chars))
-    return CharTokenizer(merged_chars, add_special=tokenizer_config.add_special)
-
-
-def _encode_rpn_text(tokenizer: CharTokenizer, text: str) -> List[int]:
-    """
-    Helper for safer RPN encoding with clearer error messages.
-    """
-    try:
-        return tokenizer.encode(text, add_bos_eos=False)
-    except ValueError as exc:
-        unknown_chars = sorted({ch for ch in set(text) if ch not in tokenizer.stoi})
-        raise ValueError(
-            f"RPN tokenizer missing chars {unknown_chars} for text '{text}'"
-        ) from exc
-
-
-def _pad_sequences(seqs: List[List[int]], pad_id: int) -> torch.Tensor:
-    max_len = max(len(s) for s in seqs) if seqs else 1
-    padded = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
-    for i, seq in enumerate(seqs):
-        if seq:
-            padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
-    return padded
-
-
-def infix_to_rpn(expr: str) -> List[str]:
-    """
-    Convert infix expression to RPN (Reverse Polish Notation).
-    Developer log: Returns char-level tokens to avoid vocab issues.
-    Numbers are split into individual digits for char-level tokenizer.
-    
-    Example: "12+34" -> ["1", "2", "3", "4", "+"]
-    Example: "5*6" -> ["5", "6", "*"]
-    Example: "10//2" -> ["1", "0", "2", "D"] (D represents //)
-    """
-    expr = expr.replace(" ", "")
-    output: List[str] = []
-    stack: List[str] = []
-
-    def precedence(op: str) -> int:
-        if op in ("*", "D"):  # D represents //
-            return 2
-        if op in ("+", "-"):
-            return 1
-        return 0
-
-    i = 0
-    while i < len(expr):
-        ch = expr[i]
-
-        if ch.isdigit():
-            # Extract single digit as single char (char-level tokenizer)
-            output.append(ch)
-            i += 1
-            continue
-
-        if ch in "+-*":
-            op = ch
-            while stack and stack[-1] not in "(" and precedence(stack[-1]) >= precedence(op):
-                output.append(stack.pop())
-            stack.append(op)
-        elif ch == "/":
-            # Check for "//" (몫 연산)
-            if i + 1 < len(expr) and expr[i + 1] == "/":
-                # Use "D" as placeholder for "//" to avoid multi-char issues
-                while stack and stack[-1] not in "(" and precedence(stack[-1]) >= precedence("D"):
-                    output.append(stack.pop())
-                stack.append("D")
-                i += 1  # Skip second "/"
-        elif ch == "(":
-            stack.append(ch)
-        elif ch == ")":
-            while stack and stack[-1] != "(":
-                output.append(stack.pop())
-            if stack and stack[-1] == "(":
-                stack.pop()
-        else:
-            # Unknown token → skip
-            pass
-        i += 1
-
-    while stack:
-        token = stack.pop()
-        if token != "(":
-            output.append(token)
-
-    return output if output else [ch for ch in expr if ch.isdigit() or ch in "+-*"]
-
-
-def _safe_infix_to_rpn(expr: str) -> List[str]:
-    try:
-        tokens = infix_to_rpn(expr)
-        if tokens:
-            return tokens
-    except Exception:
-        pass
-    return [expr]
 
 sweep_config = {
     "method": "random",  # "random", "grid", "bayes" 중 선택
@@ -256,8 +131,6 @@ def train_loop(
 
     tokenizer_config: TokenizerConfig,  # 토크나이저 설정
 
-    rpn_tokenizer: Optional[CharTokenizer] = None,
-
 ):
 
     # 모델을 GPU/CPU로 보냄
@@ -298,16 +171,6 @@ def train_loop(
     # pad 토큰은 무시하도록(ignore_index) 설정
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=output_tokenizer.pad_id)
-    use_rpn_head = (
-        rpn_tokenizer is not None
-        and hasattr(model, "forward_with_rpn")
-        and train_config.lambda_rpn > 0
-    )
-    loss_fn_rpn = (
-        nn.CrossEntropyLoss(ignore_index=rpn_tokenizer.pad_id)
-        if use_rpn_head and rpn_tokenizer is not None
-        else None
-    )
 
     step = 0
 
@@ -381,61 +244,7 @@ def train_loop(
 
             # 출력은 (B, T, V) 형태로 반환됩니다.
 
-            rpn_inp = rpn_out = None
-            result_logits = None
-            rpn_logits = None
-
-            if use_rpn_head and rpn_tokenizer is not None and loss_fn_rpn is not None:
-                rpn_inp_ids: List[List[int]] = []
-                rpn_out_ids: List[List[int]] = []
-                for idx, expr in enumerate(batch["input_text"]):
-                    tokens = _safe_infix_to_rpn(expr)
-                    rpn_text = " ".join(tokens)
-                    
-                    # Debug first batch only
-                    if step == 0 and idx == 0:
-                        print(f"\n🔍 First RPN example:")
-                        print(f"  Input expr: {expr}")
-                        print(f"  RPN tokens: {tokens}")
-                        print(f"  RPN text: '{rpn_text}'")
-                        print(f"  RPN vocab has all chars: {all(ch in rpn_tokenizer.stoi for ch in rpn_text)}")
-                        missing = [ch for ch in rpn_text if ch not in rpn_tokenizer.stoi]
-                        if missing:
-                            print(f"  ❌ Missing chars: {missing}")
-                    
-                    ids_body = _encode_rpn_text(rpn_tokenizer, rpn_text)
-                    
-                    if step == 0 and idx == 0:
-                        print(f"  Encoded IDs: {ids_body}")
-                        print(f"  Max ID: {max(ids_body) if ids_body else 'N/A'}, RPN vocab size: {rpn_tokenizer.vocab_size}")
-                        print(f"  All IDs valid: {all(0 <= i < rpn_tokenizer.vocab_size for i in ids_body)}\n")
-                    
-                    rpn_inp_ids.append([rpn_tokenizer.bos_id] + ids_body)
-                    rpn_out_ids.append(ids_body + [rpn_tokenizer.eos_id])
-
-                rpn_inp = _pad_sequences(rpn_inp_ids, rpn_tokenizer.pad_id).to(device)
-                rpn_out = _pad_sequences(rpn_out_ids, rpn_tokenizer.pad_id).to(device)
-                
-                # Additional safety check
-                if step == 0:
-                    max_inp_val = rpn_inp.max().item()
-                    max_out_val = rpn_out.max().item()
-                    print(f"🔍 RPN tensor check:")
-                    print(f"  rpn_inp max value: {max_inp_val}, vocab size: {rpn_tokenizer.vocab_size}")
-                    print(f"  rpn_out max value: {max_out_val}, vocab size: {rpn_tokenizer.vocab_size}")
-                    if max_inp_val >= rpn_tokenizer.vocab_size:
-                        print(f"  ❌ ERROR: rpn_inp has index {max_inp_val} >= vocab size {rpn_tokenizer.vocab_size}")
-                    if max_out_val >= rpn_tokenizer.vocab_size:
-                        print(f"  ❌ ERROR: rpn_out has index {max_out_val} >= vocab size {rpn_tokenizer.vocab_size}")
-
-                result_logits, rpn_logits = model.forward_with_rpn(
-                    src=src,
-                    tgt_result_inp=target_input,
-                    src_pad_id=input_tokenizer.pad_id,
-                    rpn_inp=rpn_inp,
-                )
-            else:
-                result_logits = model(src, target_input, input_tokenizer.pad_id)
+            logits = model(src, target_input, input_tokenizer.pad_id)
 
             # --------------------------------------------------------------
 
@@ -445,28 +254,11 @@ def train_loop(
 
             loss = loss_fn(
 
-                result_logits.view(-1, result_logits.size(-1)),  # (B*T, V)
+                logits.view(-1, logits.size(-1)),  # (B*T, V)
 
                 target_output.view(-1),             # (B*T,)
 
             )
-
-            if (
-                use_rpn_head
-                and rpn_logits is not None
-                and rpn_out is not None
-                and train_config.lambda_rpn > 0
-            ):
-                loss_rpn = loss_fn_rpn(
-
-                    rpn_logits.view(-1, rpn_logits.size(-1)),
-
-                    rpn_out.view(-1),
-
-                )
-                loss = loss + train_config.lambda_rpn * loss_rpn
-            else:
-                loss_rpn = None
 
             # --------------------------------------------------------------
 
@@ -491,14 +283,11 @@ def train_loop(
 
             # Log learning rate if scheduler is used
             current_lr = optim.param_groups[0]['lr']
-            log_payload = {
-                "train/loss": loss.item(),
+            wandb.log({
+                "train/loss": loss.item(), 
                 "train/lr": current_lr,
-                "step": step,
-            }
-            if loss_rpn is not None:
-                log_payload["train/loss_rpn"] = loss_rpn.item()
-            wandb.log(log_payload)
+                "step": step
+            })
 
             # --------------------------------------------------------------
 
@@ -685,44 +474,30 @@ def train_loop(
                         pred = preds_all[i]
                         ok = "✓" if pred == tgt else "✗"
                         
-                        # 카테고리 라벨 + 자리수 정보 추가
-                        import re
+                        # 카테고리 라벨 추가 (표시용)
                         category_label = ""
-                        digit_info = ""
-                        
-                        # 입력 수식에서 숫자 추출 및 자리수 분석
-                        numbers = re.findall(r'\d+', input_str)
-                        if numbers:
-                            max_digits = max(len(n) for n in numbers)
-                            num_count = len(numbers)
-                            digit_info = f"{num_count}n{max_digits}d"
-                        
-                        # 상세 카테고리 분류
-                        if "(" in input_str and "*" in input_str and ("+" in input_str or "-" in input_str):
-                            category_label = "[Mix:Paren*±]"  # 괄호+혼합
-                        elif "(" in input_str:
-                            category_label = "[Parentheses]"
-                        elif "//" in input_str:
-                            category_label = "[Division]"
-                        elif "-" in input_str and "+" not in input_str and "*" not in input_str:
-                            category_label = "[Subtraction]"
+                        if "(" in input_str:
+                            category_label = "[Law Preservation]"
                         elif any(pattern in input_str for pattern in ["+0", "*1", "+1", "*0", "0+", "1*"]):
-                            category_label = "[Identity]"
+                            category_label = "[Relational]"
                         elif len(tgt) >= 6:
-                            category_label = "[OOD:6+dig]"
-                        elif "*" in input_str and "+" not in input_str and "-" not in input_str:
-                            category_label = "[Multiply]"
-                        elif "+" in input_str and "*" not in input_str and "-" not in input_str:
-                            category_label = "[Addition]"
-                        elif "*" in input_str and "+" in input_str:
-                            category_label = "[Mix:*+]"
-                        elif "*" in input_str and "-" in input_str:
-                            category_label = "[Mix:*-]"
+                            category_label = "[OOD 6+dig]"
+                        elif "+" in input_str or "*" in input_str:
+                            tokens = input_str.replace("+", " ").replace("*", " ").replace("-", " ").replace("//", " ").split()
+                            if len(tokens) == 2 and "(" not in input_str:
+                                try:
+                                    int(tokens[0])
+                                    int(tokens[1])
+                                    category_label = "[Consistency]"
+                                except:
+                                    category_label = "[Calculation]"
+                            else:
+                                category_label = "[Calculation]"
                         else:
-                            category_label = "[Basic]"
+                            category_label = "[Calculation]"
                         
-                        pbar.write(f"  [{i:2d}] {ok} {category_label:16s} {digit_info:7s} | "
-                                 f"in: {input_str:28s} | tgt: {tgt:9s} | pred: {pred:9s}")
+                        pbar.write(f"  [{i:2d}] {ok} {category_label:20s} | "
+                                 f"input: {input_str:25s} | target: {tgt:12s} | pred: {pred:12s}")
                     
                     pbar.write("=" * 80)
 
@@ -747,11 +522,12 @@ def main():
     # Wandb 초기화
     wandb.init(
         project="inthon-2025-arithmetic",
-        name="checkpoint-resume-training",
+        name="ec-focus-finetuning",
         config={
-            "mode": "checkpoint_resume",
+            "mode": "ec_focus_finetuning",
             "augmentation": True,
             "phase": 2,
+            "ec_ratio": 0.40,  # EC 비중 40%
         }
     )
 
@@ -761,9 +537,77 @@ def main():
 
     # --------------------------------------------------------------------------
 
-    # 1) 데이터 준비
+    # 1) 데이터 준비 (EC 집중)
 
     # --------------------------------------------------------------------------
+
+    # Train Dataset, 자세한 설정은 dataloader.py를 참고하세요.
+
+    # W&B sweep 최적값 적용 (max_depth 2-3 → phase 2-3)
+    train_dataset = ArithmeticDataset(
+        num_samples=300_000,  # 샘플 수 증가 (200k → 300k)
+        phase=2,  # Phase 2: max_depth_train=2에 해당 (2-3자리)
+        seed=123,
+        mode="train",
+        enable_augmentation=True,  # EC augmentation 활성화
+    )
+
+    # Train DataLoader, 자세한 설정은 dataloader.py를 참고하세요.
+
+    train_dataloader = get_dataloader(
+
+        train_dataset,
+
+        batch_size=128,  # W&B sweep 최적값: 128
+
+        num_workers=0,
+
+        pin_memory=True,
+
+    )
+
+    # Validation Dataset: 고정된 validation 샘플 사용
+    global _FIXED_VAL_SAMPLES, _FIXED_VAL_SAMPLES_INPUTS
+    
+    if _FIXED_VAL_SAMPLES is None:
+        # 고정된 validation dataset 생성 (W&B sweep 최적값 적용: max_depth_val=3 → phase=3)
+        fixed_val_dataset = ArithmeticDataset(
+            num_samples=1000,
+            phase=3,  # Phase 3: max_depth_val=3에 해당 (3-4자리)
+            seed=999,  # 고정된 seed
+            mode="val",
+            enable_augmentation=False,
+        )
+        # Validation 샘플을 미리 생성하여 저장
+        _FIXED_VAL_SAMPLES = []
+        _FIXED_VAL_SAMPLES_INPUTS = set()
+        for i in range(len(fixed_val_dataset)):
+            sample = fixed_val_dataset[i]
+            _FIXED_VAL_SAMPLES.append(sample)
+            _FIXED_VAL_SAMPLES_INPUTS.add(sample["input_text"])
+    
+    # 고정된 validation 샘플을 사용하는 Dataset wrapper
+    class FixedValidationDataset:
+        def __init__(self, samples):
+            self.samples = samples
+            self.mode = "val"
+        
+        def __len__(self):
+            return len(self.samples)
+        
+        def __getitem__(self, idx):
+            return self.samples[idx]
+    
+    val_dataset = FixedValidationDataset(_FIXED_VAL_SAMPLES)
+    
+    # Validation DataLoader, 자세한 설정은 dataloader.py를 참고하세요.
+    val_dataloader = get_dataloader(
+        val_dataset,
+        batch_size=128,
+        num_workers=0,
+        pin_memory=True,
+        mode="val",
+    )
 
     # --------------------------------------------------------------------------
 
@@ -806,18 +650,6 @@ def main():
         add_special=tokenizer_config.add_special,
 
     )
-    
-    rpn_tokenizer = build_rpn_tokenizer(tokenizer_config)
-    
-    # Debug RPN tokenizer vocab
-    print("\n" + "=" * 70)
-    print("🔍 RPN Tokenizer Debugging Info")
-    print("=" * 70)
-    print(f"RPN vocab size: {rpn_tokenizer.vocab_size}")
-    print(f"RPN vocab chars: {sorted(rpn_tokenizer.stoi.keys())}")
-    print(f"OUTPUT_CHARS: {list(OUTPUT_CHARS)}")
-    print(f"RPN_EXTRA_CHARS: {RPN_EXTRA_CHARS}")
-    print("=" * 70 + "\n")
 
     # --------------------------------------------------------------------------
 
@@ -873,51 +705,32 @@ def main():
 
     #-----------------------------
 
-    base_model_config = ModelConfig()
+    # W&B sweep 최적값 적용
+    model_config = ModelConfig(
+        d_model=256,  # W&B sweep 최적값
+        nhead=2,  # W&B sweep 최적값
+        num_encoder_layers=6,  # W&B sweep 최적값
+        num_decoder_layers=2,  # W&B sweep 최적값
+        dim_feedforward=1024,  # W&B sweep 최적값
+        dropout=0.0,  # W&B sweep 최적값 (과적합 없음)
+    )
 
     train_config = TrainConfig(
-        save_best_path="best_model.pt",
-        enable_early_stopping=False,  # 전체 학습 진행
-    )
-
-    model_config = apply_depth_profile(base_model_config, train_config.depth_profile)
-
-    # --------------------------------------------------------------------------
-    #
-    # 1-2) 데이터 준비 (Train / Validation)
-    #
-    # --------------------------------------------------------------------------
-
-    train_dataset = ArithmeticDataset(
-        num_samples=train_config.train_num_samples,
-        phase=train_config.train_phase_mix[0],
-        phase_mix=train_config.train_phase_mix,
-        seed=123,
-        mode="train",
-        enable_augmentation=True,
-    )
-
-    train_dataloader = get_dataloader(
-        train_dataset,
-        batch_size=train_config.batch_size,
-        num_workers=0,
-        pin_memory=True,
-    )
-
-    val_dataset = ArithmeticDataset(
-        num_samples=train_config.val_num_samples,
-        phase=train_config.val_phase,
-        seed=999,
-        mode="val",
-        enable_augmentation=False,
-    )
-
-    val_dataloader = get_dataloader(
-        val_dataset,
-        batch_size=min(train_config.batch_size, 256),
-        num_workers=0,
-        pin_memory=True,
-        mode="val",
+        max_train_steps=None,
+        lr=1e-4,  # EC fine-tuning용 낮춤 (기존 2e-4 → 1e-4)
+        warmup_steps=3000,  # Warmup 단축 (fine-tuning이므로)
+        weight_decay=0.1,  # 문헌 권장
+        grad_clip=1.0,  # 문헌 권장
+        valid_every=200,
+        max_gen_len=50,
+        show_valid_samples=5,
+        num_epochs=10,  # EC fine-tuning: 10 epochs
+        save_best_path="best_model_ec.pt",
+        use_cosine_schedule=True,  # cosine decay 유지
+        enable_early_stopping=False,  # main()에서는 early stopping 비활성화 (전체 학습)
+        early_stopping_patience=5,
+        min_lr_threshold=1e-6,
+        min_em_threshold=0.01,
     )
 
     # --------------------------------------------------------------------------
@@ -940,53 +753,24 @@ def main():
 
     # )
 
-    rpn_vocab = (
-        rpn_tokenizer.vocab_size
-        if rpn_tokenizer is not None and train_config.lambda_rpn > 0
-        else None
-    )
-    
-    print(f"\n🔍 Model initialization:")
-    print(f"  in_vocab: {input_tokenizer.vocab_size}")
-    print(f"  out_vocab: {output_tokenizer.vocab_size}")
-    print(f"  rpn_vocab: {rpn_vocab}")
-    print(f"  lambda_rpn: {train_config.lambda_rpn}")
-    print()
-
     model = TransformerSeq2Seq(
-        in_vocab=input_tokenizer.vocab_size,
-        out_vocab=output_tokenizer.vocab_size,
-        rpn_vocab=rpn_vocab,
-        **model_config.__dict__,
-    )
-    
-    # Verify RPN head was initialized correctly
-    if rpn_vocab is not None:
-        print(f"✅ RPN head initialized:")
-        print(f"  rpn_embed num_embeddings: {model.rpn_embed.num_embeddings if model.rpn_embed else 'None'}")
-        print(f"  rpn_out out_features: {model.rpn_out.out_features if model.rpn_out else 'None'}")
-        print()
+
+    in_vocab=input_tokenizer.vocab_size,
+
+    out_vocab=output_tokenizer.vocab_size,
+
+     **model_config.__dict__,)
 
     # --------------------------------------------------------------------------
-    # 체크포인트 로드 (Resume training with compatibility check)
+    # 체크포인트 로드 (Resume training)
     # --------------------------------------------------------------------------
     
     resume_checkpoint = "best_model.pt"  # 체크포인트 파일 경로
     resume_from_checkpoint = True  # True로 설정하면 체크포인트에서 재개
     
-    # A100 최적화 전 모델 설정 (d_model=256, nhead=2)
-    OLD_MODEL_CONFIG = {
-        "d_model": 256,
-        "nhead": 2,
-        "num_encoder_layers": 6,
-        "num_decoder_layers": 2,
-        "dim_feedforward": 1024,
-        "dropout": 0.0,
-    }
-    
     if resume_from_checkpoint and os.path.exists(resume_checkpoint):
         print("=" * 70)
-        print(f"🔄 Checking checkpoint: {resume_checkpoint}")
+        print(f"🔄 Resuming from checkpoint: {resume_checkpoint}")
         print("=" * 70)
         
         try:
@@ -994,66 +778,29 @@ def main():
             checkpoint = torch.load(resume_checkpoint, map_location=device)
             
             # 저장된 설정 확인 및 비교
-            config_match = True
             if "model_config" in checkpoint:
                 saved_config = checkpoint["model_config"]
-                print("\n📋 Checkpoint Configuration Comparison:")
-                print(f"{'Parameter':<25} {'Current':<12} {'Saved':<12} {'Match'}")
-                print("-" * 70)
-                
+                print("\n📋 Checkpoint Configuration:")
+                config_match = True
                 for key in ["d_model", "nhead", "num_encoder_layers", "num_decoder_layers", "dim_feedforward", "dropout"]:
                     current_val = model_config.__dict__[key]
-                    saved_val = saved_config.get(key, "N/A")
-                    is_match = current_val == saved_val
-                    match_symbol = "✅" if is_match else "❌"
-                    print(f"{key:<25} {str(current_val):<12} {str(saved_val):<12} {match_symbol}")
-                    if not is_match:
+                    saved_val = saved_config[key]
+                    match_symbol = "✅" if current_val == saved_val else "⚠️"
+                    print(f"  {match_symbol} {key:20s}: current={current_val:6}, saved={saved_val:6}")
+                    if current_val != saved_val:
                         config_match = False
+                
+                if not config_match:
+                    print("\n⚠️  WARNING: Model configuration mismatch detected!")
+                    print("   Using current configuration. Weights may not load correctly.")
+                else:
+                    print("\n✅ Configuration matches!")
             
-            state_dict = checkpoint["model_state"]
-            incompatible = model.load_state_dict(state_dict, strict=False)
-            missing_keys = incompatible.missing_keys
-            unexpected_keys = incompatible.unexpected_keys
-
-            if config_match:
-                print("\n✅ Configuration matches! Model weights loaded successfully.")
-            else:
-                print("\n⚠️  Model configuration mismatch detected!")
-                print("   Current model depth differs from checkpoint (expected for depth_profile).")
-                print("   Missing keys will be randomly initialized; training will fine-tune them.")
-
-            if missing_keys:
-                print(f"   ℹ️ Missing keys ({len(missing_keys)}): {missing_keys[:8]}{' ...' if len(missing_keys) > 8 else ''}")
-            if unexpected_keys:
-                print(f"   ℹ️ Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:8]}{' ...' if len(unexpected_keys) > 8 else ''}")
-
-            # Verify RPN head after checkpoint loading
-            if rpn_vocab is not None and model.rpn_embed is not None:
-                actual_rpn_embed_size = model.rpn_embed.num_embeddings
-                if actual_rpn_embed_size != rpn_vocab:
-                    print(f"   ⚠️ WARNING: RPN embed size mismatch!")
-                    print(f"      Expected: {rpn_vocab}, Got: {actual_rpn_embed_size}")
-                    print(f"      This will cause CUDA index errors. Reinitializing RPN head...")
-                    # Reinitialize RPN head with correct size
-                    d_model = model_config.d_model
-                    nhead = model_config.nhead
-                    dim_feedforward = model_config.dim_feedforward
-                    dropout = model_config.dropout
-                    num_decoder_layers = model_config.num_decoder_layers
-                    
-                    rpn_decoder_layer = nn.TransformerDecoderLayer(
-                        d_model=d_model,
-                        nhead=nhead,
-                        dim_feedforward=dim_feedforward,
-                        dropout=dropout,
-                        batch_first=True,
-                    )
-                    model.rpn_decoder = nn.TransformerDecoder(rpn_decoder_layer, num_layers=num_decoder_layers)
-                    model.rpn_embed = nn.Embedding(rpn_vocab, d_model)
-                    model.rpn_out = nn.Linear(d_model, rpn_vocab)
-                    model.to(device)  # Move new layers to device
-                    print(f"      ✅ RPN head reinitialized with vocab size {rpn_vocab}")
-
+            # 모델 weights 로드
+            model.load_state_dict(checkpoint["model_state"])
+            print("\n✅ Model weights loaded successfully")
+            
+            # Step 정보 출력
             if "step" in checkpoint:
                 print(f"📊 Resuming from step: {checkpoint['step']}")
             
@@ -1067,10 +814,8 @@ def main():
             print()
     
     elif resume_from_checkpoint and not os.path.exists(resume_checkpoint):
-        print("=" * 70)
-        print(f"ℹ️  Checkpoint file not found: {resume_checkpoint}")
-        print("🚀 Starting training from scratch with A100-optimized model...")
-        print("=" * 70)
+        print(f"⚠️  Checkpoint file not found: {resume_checkpoint}")
+        print("Starting training from scratch...")
         print()
 
     # --------------------------------------------------------------------------
@@ -1099,8 +844,6 @@ def main():
 
         tokenizer_config=tokenizer_config,  # 토크나이저 설정 전달
 
-        rpn_tokenizer=rpn_tokenizer,
-
     )
 
     # --------------------------------------------------------------------------
@@ -1114,143 +857,205 @@ def main():
     print("Saved model.pt")
 
 def train_run():
+    global _FIXED_VAL_SAMPLES, _FIXED_VAL_SAMPLES_INPUTS
+    
+    # GPU/CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # wandb.init: sweep에서는 config를 넘겨주지 않고, agent가 알아서 주입
     with wandb.init(project="inthon-2025-arithmetic"):
         cfg = wandb.config
-        run_name = wandb.run.name  # finish 이후 접근 불가하므로 미리 저장
+        run_name = wandb.run.name  # 미리 저장 (finish 후 접근 불가)
 
-        tokenizer_config = TokenizerConfig(
-            input_chars=INPUT_CHARS,
-            output_chars=OUTPUT_CHARS,
-            add_special=True,
-        )
-
-        input_tokenizer = CharTokenizer(
-            tokenizer_config.input_chars if tokenizer_config.input_chars is not None else INPUT_CHARS,
-            add_special=tokenizer_config.add_special,
-        )
-
-        output_tokenizer = CharTokenizer(
-            tokenizer_config.output_chars if tokenizer_config.output_chars is not None else OUTPUT_CHARS,
-            add_special=tokenizer_config.add_special,
-        )
-        rpn_tokenizer = build_rpn_tokenizer(tokenizer_config)
-
-        phase_mix_cfg = cfg.get("phase_mix", None)
-        if phase_mix_cfg is not None:
-            if isinstance(phase_mix_cfg, (list, tuple)):
-                phase_mix = tuple(max(1, min(4, int(p))) for p in phase_mix_cfg)
-            else:
-                phase_mix = (max(1, min(4, int(phase_mix_cfg))),)
-        elif cfg.get("phase", None) is not None:
-            phase_mix = (max(1, min(4, int(cfg.get("phase", 2)))),)
-        else:
-            phase_mix = (2, 3, 4)
-
-        train_config = TrainConfig(
-            max_train_steps=None,
-            lr=cfg.lr,
-            warmup_steps=5000,
-            weight_decay=0.1,
-            grad_clip=1.0,
-            valid_every=200,
-            max_gen_len=50,
-            show_valid_samples=5,
-            num_epochs=20,
-            save_best_path=f"best_{run_name}.pt",
-            use_cosine_schedule=True,
-            enable_early_stopping=True,
-            early_stopping_patience=5,
-            min_lr_threshold=1e-6,
-            min_em_threshold=0.01,
-            batch_size=cfg.batch_size,
-            depth_profile=cfg.get("depth_profile", "baseline"),
-            train_num_samples=cfg.get("train_num_samples", 900_000),
-            val_num_samples=cfg.get("val_num_samples", 3_000),
-            train_phase_mix=phase_mix,
-            val_phase=max(1, min(4, int(cfg.get("val_phase", 4)))),
-        )
-
-        override_fields = [
-            "d_model",
-            "nhead",
-            "num_encoder_layers",
-            "num_decoder_layers",
-            "dim_feedforward",
-            "dropout",
-        ]
-        if all(hasattr(cfg, field) for field in override_fields):
-            model_config = ModelConfig(
-                d_model=cfg.d_model,
-                nhead=cfg.nhead,
-                num_encoder_layers=cfg.num_encoder_layers,
-                num_decoder_layers=cfg.num_decoder_layers,
-                dim_feedforward=cfg.dim_feedforward,
-                dropout=cfg.dropout,
+        # ----------------------------------------------------------------------
+        # 1) 고정된 Validation 데이터셋 생성 (한 번만)
+        # ----------------------------------------------------------------------
+        if _FIXED_VAL_SAMPLES is None:
+            # 고정된 validation dataset 생성 (W&B sweep 최적값 적용: max_depth_val=3 → phase=3)
+            fixed_val_dataset = ArithmeticDataset(
+                num_samples=1000,
+                phase=3,  # Phase 3: max_depth_val=3에 해당 (3-4자리)
+                seed=999,  # 고정된 seed
+                mode="val",
+                enable_augmentation=False,
             )
-        else:
-            base_model_config = ModelConfig()
-            model_config = apply_depth_profile(base_model_config, train_config.depth_profile)
+            # Validation 샘플을 미리 생성하여 저장
+            _FIXED_VAL_SAMPLES = []
+            _FIXED_VAL_SAMPLES_INPUTS = set()
+            for i in range(len(fixed_val_dataset)):
+                sample = fixed_val_dataset[i]
+                _FIXED_VAL_SAMPLES.append(sample)
+                _FIXED_VAL_SAMPLES_INPUTS.add(sample["input_text"])
+        
+        # 고정된 validation 샘플로 dataset 생성
+        # 고정된 validation 샘플을 사용하는 간단한 Dataset wrapper
+        class FixedValidationDataset:
+            def __init__(self, samples):
+                self.samples = samples
+                self.mode = "val"  # mode 속성 추가 (get_dataloader에서 사용)
+            
+            def __len__(self):
+                return len(self.samples)
+            
+            def __getitem__(self, idx):
+                return self.samples[idx]
+        
+        val_dataset = FixedValidationDataset(_FIXED_VAL_SAMPLES)
+        val_dataloader = get_dataloader(
+            val_dataset,
+            batch_size=cfg.batch_size,
+            num_workers=0,
+            pin_memory=True,
+            mode="val",
+        )
 
+        # ----------------------------------------------------------------------
+        # 2) Train 데이터 준비 (validation 샘플 제외)
+        # ----------------------------------------------------------------------
+        # Train dataset 생성 시 validation 샘플과 겹치지 않도록 다른 seed 사용
+        # (validation seed=999, train seed=123으로 이미 다름)
+        # W&B sweep 최적값 적용: max_depth_train=2 → phase=2
         train_dataset = ArithmeticDataset(
-            num_samples=train_config.train_num_samples,
-            phase=train_config.train_phase_mix[0],
-            phase_mix=train_config.train_phase_mix,
-            seed=123,
+            num_samples=200_000,  # 적당한 샘플 수
+            phase=cfg.get("phase", 2),  # 기본값: phase 2 (W&B sweep 최적값)
+            seed=123,  # Train용 고정 seed (validation과 다름)
             mode="train",
             enable_augmentation=True,
         )
 
         train_dataloader = get_dataloader(
             train_dataset,
-            batch_size=train_config.batch_size,
+            batch_size=cfg.batch_size,
             num_workers=0,
             pin_memory=True,
         )
 
-        val_dataset = ArithmeticDataset(
-            num_samples=train_config.val_num_samples,
-            phase=train_config.val_phase,
-            seed=999,
-            mode="val",
-            enable_augmentation=False,
+        # ----------------------------------------------------------------------
+
+        # 2) 토크나이저 설정 및 생성
+
+        # ----------------------------------------------------------------------
+
+        tokenizer_config = TokenizerConfig(
+
+            input_chars=INPUT_CHARS,
+
+            output_chars=OUTPUT_CHARS,
+
+            add_special=True,
+
         )
 
-        val_dataloader = get_dataloader(
-            val_dataset,
-            batch_size=min(train_config.batch_size, 256),
-            num_workers=0,
-            pin_memory=True,
-            mode="val",
+        input_tokenizer = CharTokenizer(
+
+            tokenizer_config.input_chars if tokenizer_config.input_chars is not None else INPUT_CHARS,
+
+            add_special=tokenizer_config.add_special,
+
         )
 
-        rpn_vocab = (
-            rpn_tokenizer.vocab_size
-            if rpn_tokenizer is not None and train_config.lambda_rpn > 0
-            else None
+        output_tokenizer = CharTokenizer(
+
+            tokenizer_config.output_chars if tokenizer_config.output_chars is not None else OUTPUT_CHARS,
+
+            add_special=tokenizer_config.add_special,
+
         )
+
+        # ----------------------------------------------------------------------
+
+        # 3) 모델 설정 (cfg 기반)
+
+        # ----------------------------------------------------------------------
+
+        model_config = ModelConfig(
+
+            d_model=cfg.d_model,
+
+            nhead=cfg.nhead,  # ⚠️ model.py에서 n_head 또는 nhead 잘 맞춰줘야 함
+
+            num_encoder_layers=cfg.num_encoder_layers,
+
+            num_decoder_layers=cfg.num_decoder_layers,
+
+            dim_feedforward=cfg.dim_feedforward,
+
+            dropout=cfg.dropout,
+
+        )
+
+        # ----------------------------------------------------------------------
+
+        # 4) 학습 설정 (cfg 기반)
+
+        # ----------------------------------------------------------------------
+
+        # TrainConfig 생성 시 cfg에서 필요한 값만 명시적으로 전달
+        # (Wandb가 cfg에 예상치 못한 키를 추가할 수 있으므로 명시적으로 처리)
+        train_config = TrainConfig(
+            max_train_steps=None,
+            lr=cfg.lr,
+            warmup_steps=5000,  # 고정값: warmup 5k steps (문헌 권장)
+            weight_decay=0.1,  # 고정값: weight decay 0.1 (문헌 권장)
+            grad_clip=1.0,  # 고정값: grad clip 1.0 (문헌 권장)
+            valid_every=200,
+            max_gen_len=50,
+            show_valid_samples=5,
+            num_epochs=20,  # W&B sweep 최적값: 20 epochs
+            save_best_path=f"best_{run_name}.pt",  # run_name 미리 저장한 값 사용
+            use_cosine_schedule=True,  # cosine decay 유지
+            enable_early_stopping=True,  # wandb sweep용 early stopping 활성화
+            early_stopping_patience=5,  # 5번의 validation 동안 개선 없으면 종료
+            min_lr_threshold=1e-6,  # 학습률이 1e-6 이하로 떨어지면 종료
+            min_em_threshold=0.01,  # EM이 0.01 이하이고 patience 초과 시 종료
+        )
+
+        # ----------------------------------------------------------------------
+
+        # 5) 모델 생성
+
+        # ----------------------------------------------------------------------
 
         model = TransformerSeq2Seq(
+
             in_vocab=input_tokenizer.vocab_size,
+
             out_vocab=output_tokenizer.vocab_size,
-            rpn_vocab=rpn_vocab,
-            **model_config.__dict__,
+
+            **model_config.__dict__,  # d_model, n_head, num_layers 등 전달
+
         )
+
+        # ----------------------------------------------------------------------
+
+        # 6) 학습 시작
+
+        # ----------------------------------------------------------------------
 
         train_loop(
+
             model=model,
+
             dataloader=train_dataloader,
+
             input_tokenizer=input_tokenizer,
+
             output_tokenizer=output_tokenizer,
+
             device=device,
+
             val_dataloader=val_dataloader,
+
             train_config=train_config,
+
             model_config=model_config,
+
             tokenizer_config=tokenizer_config,
-            rpn_tokenizer=rpn_tokenizer,
+
         )
 
+        # 원하면 각 run 끝에 최종 모델도 따로 저장 가능
+        # wandb.run.name은 finish 후 접근 불가하므로 미리 저장한 값 사용
         torch.save(model.state_dict(), "model_last.pt")
         print("Saved model_last.pt for run:", run_name)
 

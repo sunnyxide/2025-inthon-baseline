@@ -1,0 +1,34 @@
+# Local Development Environment Requirements
+# 평가 서버와 동일한 환경을 로컬에서 구성하기 위한 requirements.txt
+# 
+# 주의: 평가 서버 제출 시에는 이 파일을 사용하지 마세요!
+# 평가 서버에는 이미 아래 라이브러리들이 사전 설치되어 있습니다.
+
+# PyTorch (CUDA 12.1)
+# macOS의 경우 CPU 버전만 사용 가능
+# Linux/Windows에서 GPU 사용 시 CUDA 12.1이 설치되어 있어야 함
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# 수치 계산 및 유틸리티
+numpy==2.2.6
+tqdm==4.67.1
+
+# NLP 및 모델 라이브러리
+transformers==4.57.1
+tokenizers==0.22.1
+sentencepiece==0.2.1
+
+# 최적화 및 유틸리티
+accelerate==1.11.0
+einops==0.8.1
+safetensors==0.6.2
+regex==2025.11.3
+pydantic==2.12.4
+
+# 개발 편의용 (선택)
+jupyter
+matplotlib
+pandas
+

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 from dataclasses import dataclass
 
 import torch
 
 import torch.nn as nn
-
 import math
 
 from do_not_edit.model_template import BaseModel
@@ -379,21 +378,24 @@ class TinySeq2Seq(nn.Module):
         # 생성된 토큰이 없으면 빈 텐서 반환
         return torch.empty((B, 0), dtype=torch.long, device=src.device)
 
-
 class PositionalEncoding(nn.Module):
     """
     표준 sin/cos 위치 인코딩.
+
     입력: [B, T, d_model]
     출력: [B, T, d_model] (positional encoding이 더해진 결과)
     """
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
+
         pe = torch.zeros(max_len, d_model)  # [T, d_model]
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [T, 1]
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+
         pe[:, 0::2] = torch.sin(position * div_term)   # 짝수 차원
         pe[:, 1::2] = torch.cos(position * div_term)   # 홀수 차원
+
         pe = pe.unsqueeze(0)  # [1, T, d_model]
         self.register_buffer("pe", pe)
 
@@ -410,6 +412,7 @@ class PositionalEncoding(nn.Module):
 def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
     """
     디코더용 causal mask (각 위치가 이전 토큰까지만 볼 수 있도록).
+
     반환: [T, T] float 텐서 (masked 위치는 -inf, 나머지는 0)
     """
     mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)  # 상삼각(대각선 위) = 1
@@ -421,6 +424,7 @@ def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Ten
 class TransformerSeq2Seq(nn.Module):
     """
     문자 단위 Transformer 기반 Seq2Seq 모델.
+
     - 인코더: TransformerEncoder
     - 디코더: TransformerDecoder
     - forward:
@@ -431,8 +435,10 @@ class TransformerSeq2Seq(nn.Module):
         src  : [B, S]
         -> greedy decoding으로 [B, T'] 생성
     """
+
     def __init__(self, in_vocab: int, out_vocab: int, **kwargs):
         super().__init__()
+
         # 기본 하이퍼파라미터 설정 (model_config_dict에서 override 가능)
         d_model = kwargs.get("d_model", 256)
         nhead = kwargs.get("nhead", 4)
@@ -440,11 +446,10 @@ class TransformerSeq2Seq(nn.Module):
         num_decoder_layers = kwargs.get("num_decoder_layers", 4)
         dim_feedforward = kwargs.get("dim_feedforward", 512)
         dropout = kwargs.get("dropout", 0.1)
-        rpn_vocab = kwargs.get("rpn_vocab")
+
         self.d_model = d_model
         self.in_vocab = in_vocab
         self.out_vocab = out_vocab
-        self.rpn_vocab = rpn_vocab
 
         # 임베딩
         self.embed_in = nn.Embedding(in_vocab, d_model)
@@ -476,23 +481,6 @@ class TransformerSeq2Seq(nn.Module):
         # 출력 projection
         self.out_proj = nn.Linear(d_model, out_vocab)
 
-        # RPN auxiliary decoder/projection (훈련 전용, optional)
-        if rpn_vocab is not None:
-            rpn_decoder_layer = nn.TransformerDecoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                batch_first=True,
-            )
-            self.rpn_decoder = nn.TransformerDecoder(rpn_decoder_layer, num_layers=num_decoder_layers)
-            self.rpn_embed = nn.Embedding(rpn_vocab, d_model)
-            self.rpn_out = nn.Linear(d_model, rpn_vocab)
-        else:
-            self.rpn_decoder = None
-            self.rpn_embed = None
-            self.rpn_out = None
-
     def forward(
         self,
         src: torch.Tensor,       # [B, S]
@@ -502,6 +490,7 @@ class TransformerSeq2Seq(nn.Module):
     ) -> torch.Tensor:
         """
         학습 시 순전파.
+
         반환: logits [B, T, out_vocab]
         """
         device = src.device
@@ -539,61 +528,6 @@ class TransformerSeq2Seq(nn.Module):
         logits = self.out_proj(dec_out)  # [B, T, out_vocab]
         return logits
 
-    def forward_with_rpn(
-        self,
-        src: torch.Tensor,
-        tgt_result_inp: torch.Tensor,
-        src_pad_id: int,
-        rpn_inp: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        학습 시 결과/보조(RPN) 디코더를 동시에 실행.
-        Returns:
-            result_logits: [B, T_res, out_vocab]
-            rpn_logits   : [B, T_rpn, out_vocab]
-        """
-        if self.rpn_decoder is None or self.rpn_embed is None or self.rpn_out is None:
-            raise RuntimeError("RPN head is not initialized; pass rpn_vocab when constructing the model.")
-        device = src.device
-        B, S = src.size()
-        _, T_result = tgt_result_inp.size()
-        _, T_rpn = rpn_inp.size()
-
-        # --- Encoder ---
-        src_emb = self.embed_in(src) * math.sqrt(self.d_model)
-        src_emb = self.pos_enc_in(src_emb)
-        src_key_padding_mask = (src == src_pad_id)
-        memory = self.encoder(
-            src_emb,
-            src_key_padding_mask=src_key_padding_mask,
-        )
-
-        # --- Result decoder ---
-        res_emb = self.embed_out(tgt_result_inp) * math.sqrt(self.d_model)
-        res_emb = self.pos_enc_out(res_emb)
-        res_mask = _generate_square_subsequent_mask(T_result, device=device)
-        res_out = self.decoder(
-            res_emb,
-            memory,
-            tgt_mask=res_mask,
-            memory_key_padding_mask=src_key_padding_mask,
-        )
-        result_logits = self.out_proj(res_out)
-
-        # --- RPN decoder (훈련 전용) ---
-        rpn_emb = self.rpn_embed(rpn_inp) * math.sqrt(self.d_model)
-        rpn_emb = self.pos_enc_out(rpn_emb)
-        rpn_mask = _generate_square_subsequent_mask(T_rpn, device=device)
-        rpn_out = self.rpn_decoder(
-            rpn_emb,
-            memory,
-            tgt_mask=rpn_mask,
-            memory_key_padding_mask=src_key_padding_mask,
-        )
-        rpn_logits = self.rpn_out(rpn_out)
-
-        return result_logits, rpn_logits
-
     @torch.no_grad()
     def generate(
         self,
@@ -605,6 +539,7 @@ class TransformerSeq2Seq(nn.Module):
     ) -> torch.Tensor:
         """
         추론 시 greedy decoding.
+
         반환: [B, T'] (EOS 나오면 중단, 아니면 max_len까지)
         """
         device = src.device
@@ -622,12 +557,15 @@ class TransformerSeq2Seq(nn.Module):
         # 디코더 입력 시작: BOS
         y = torch.full((B, 1), bos_id, dtype=torch.long, device=device)  # [B, 1]
         finished = torch.zeros(B, dtype=torch.bool, device=device)
+
         outputs = []
 
         for _ in range(max_len):
             T = y.size(1)
+
             tgt_emb = self.embed_out(y) * math.sqrt(self.d_model)  # [B, T, d_model]
             tgt_emb = self.pos_enc_out(tgt_emb)
+
             tgt_mask = _generate_square_subsequent_mask(T, device=device)  # [T, T]
 
             dec_out = self.decoder(
@@ -640,6 +578,7 @@ class TransformerSeq2Seq(nn.Module):
             last_step = dec_out[:, -1, :]        # [B, d_model]
             logits = self.out_proj(last_step)    # [B, out_vocab]
             next_id = torch.argmax(logits, dim=-1)  # [B]
+
             outputs.append(next_id)
 
             # y에 토큰 추가
@@ -647,15 +586,14 @@ class TransformerSeq2Seq(nn.Module):
 
             # EOS가 나온 샘플은 finished 표시
             finished = finished | (next_id == eos_id)
-
             # 모든 샘플이 EOS를 낸 경우 종료
             if torch.all(finished):
                 break
 
         if outputs:
             return torch.stack(outputs, dim=1)  # [B, gen_len]
-        return torch.empty((B, 0), dtype=torch.long, device=device)
 
+        return torch.empty((B, 0), dtype=torch.long, device=device)
 
 # ========================
 # InThon 규정용 Model
@@ -728,7 +666,8 @@ class Model(BaseModel):
         #     out_vocab=self.output_tokenizer.vocab_size,  # 출력 vocab 크기
         #     **model_config_dict,  # 모델 설정을 **kwargs로 전달
         # ).to(self.device)  # 지정된 디바이스로 이동
-
+        
+        
         #Transformer 모델 인스턴스
         self.model = TransformerSeq2Seq(
         in_vocab=self.input_tokenizer.vocab_size,
