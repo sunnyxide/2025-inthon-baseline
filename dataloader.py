@@ -32,10 +32,10 @@ PHASE_DIGIT_DISTRIBUTION = {
 }
 
 OUTPUT_6DIGIT_RATIO = {
-    "base_calculation": 0.15,        # 0.05 → 0.15 (큰수 연산 강화)
-    "precedence": 0.20,              # 0.10 → 0.20 (큰수 연산 강화)
-    "expression_consistency": 0.35,  # 0.30 → 0.35 (큰수 EC 강화)
-    "relational": 0.40,              # 0.30 → 0.40 (큰수 관계성 강화)
+    "base_calculation": 0.05,        # baseline 유지 (EC 집중)
+    "precedence": 0.10,              # baseline 유지 (EC 집중)
+    "expression_consistency": 0.20,  # baseline 유지 (작은 수에서 EC 먼저 해결)
+    "relational": 0.30,              # baseline 유지
     "single_number": 0.00,
 }
 
@@ -342,8 +342,8 @@ def _gen_expression_consistency_base(
             return f"{a}{op}{b}", (a + b if op == "+" else a * b)
         return f"{b}{op}{a}", (a + b if op == "+" else a * b)
 
-    # 75% 확률로 단순 이항 연산 (교환법칙 집중) - EC 강화: 60% → 75%
-    if rng.random() < 0.75:
+    # 80% 확률로 단순 이항 연산 (교환법칙 집중) - EC 강화: 60% → 80%
+    if rng.random() < 0.80:
         op = rng.choice(["+", "*"])
         a = _rand_int(rng, (1, digit_len))
         b = _rand_int(rng, (1, digit_len))
