@@ -145,7 +145,7 @@ def _compute_rpn_stack_values(expr: str) -> List[float]:
     """
     Infix 식에서 RPN 스택 중간 값(연산자 적용 직후 top 값)의 log-scale 리스트를 계산.
     Developer log: scratchpad supervision용 label 생성 (train 전용).
-    음수 결과는 데이터 생성 단계에서 이미 필터링되므로 발생하지 않음.
+    음수 결과는 데이터 생성 단계에서 이미 필터링되므로 발생하지 않음 (제3조 ②항).
     """
     rpn_tokens = _infix_to_rpn_numbers(expr)
     stack: List[int] = []
@@ -162,7 +162,7 @@ def _compute_rpn_stack_values(expr: str) -> List[float]:
                 res = a - b  # 음수는 데이터 생성에서 이미 방지됨
             elif tok == "*":
                 res = a * b
-            else:
+            else:  # "//"
                 if b == 0:
                     # 방어적 처리: 0으로 나누기 발생 시 결과를 0으로 클램핑
                     res = 0
@@ -173,6 +173,76 @@ def _compute_rpn_stack_values(expr: str) -> List[float]:
             values.append(math.log10(res + 1.0))
         # 기타 토큰은 무시
     return values
+
+
+def compute_ec_consistency_loss(
+    logits: torch.Tensor,
+    target_output: torch.Tensor,
+    meta_list: List[dict] | None,
+    pad_id: int,
+    lambda_consistency: float,
+) -> torch.Tensor | None:
+    """
+    Expression Consistency 강화를 위한 동치 수식 그룹 consistency loss.
+    
+    Developer log: 같은 group_id를 가진 동치 수식 쌍/트리플의 출력 분포를 일치시킴.
+    Law Preservation / Expression Consistency 지표 직접 개선용.
+
+    Args:
+        logits: (B, T, V) 모델 출력 (result_logits)
+        target_output: (B, T) target token ids (pad 포함)
+        meta_list: batch["meta"] (각 샘플별 dict, group_id 포함)
+        pad_id: 출력 토크나이저 pad_id
+        lambda_consistency: 손실 가중치 (0이면 사용 안 함)
+
+    Returns:
+        스칼라 loss 텐서 또는 None
+    """
+    if meta_list is None or lambda_consistency <= 0.0:
+        return None
+
+    # 1) group_id -> index 리스트 매핑 생성
+    group_map: dict[str, list[int]] = {}
+    for idx, meta in enumerate(meta_list):
+        gid = meta.get("group_id")
+        if gid is None:
+            continue
+        group_map.setdefault(gid, []).append(idx)
+
+    # 2) 두 개 이상 샘플이 모인 그룹만 사용
+    groups = [idxs for idxs in group_map.values() if len(idxs) > 1]
+    if not groups:
+        return None
+
+    # 3) 확률 분포와 마스크 계산
+    probs = torch.softmax(logits, dim=-1)              # (B, T, V)
+    mask = (target_output != pad_id).unsqueeze(-1)     # (B, T, 1), pad 토큰 제외용
+    mask = mask.float()
+
+    total_loss = logits.new_tensor(0.0)
+    group_count = 0
+
+    for idxs in groups:
+        # (G, T, V), (G, T, 1)
+        g_probs = probs[idxs]          # 동치 수식 그룹의 출력 분포
+        g_mask = mask[idxs]
+
+        # 그룹 평균 분포 (pad 위치는 제외)
+        denom = g_mask.sum(dim=0, keepdim=True).clamp_min(1.0)  # (1, T, 1)
+        mean_probs = (g_probs * g_mask).sum(dim=0, keepdim=True) / denom  # (1, T, V)
+
+        # 각 샘플 분포가 mean_probs 와 비슷해지도록 L2 penalty
+        diff = (g_probs - mean_probs) ** 2
+        diff = diff * g_mask  # pad 위치 제외
+        group_loss = diff.sum() / g_mask.sum().clamp_min(1.0)
+
+        total_loss = total_loss + group_loss
+        group_count += 1
+
+    if group_count == 0:
+        return None
+
+    return lambda_consistency * (total_loss / group_count)
 
 
 def _pad_sequences(seqs: List[List[int]], pad_id: int) -> torch.Tensor:
@@ -648,6 +718,18 @@ def train_loop(
             else:
                 loss_rpn_value = None
 
+            # EC Consistency Loss (동치 수식 그룹용)
+            batch_meta = batch.get("meta") if isinstance(batch, dict) else None
+            loss_ec = compute_ec_consistency_loss(
+                logits=result_logits,
+                target_output=target_output,
+                meta_list=batch_meta,
+                pad_id=output_tokenizer.pad_id,
+                lambda_consistency=train_config.lambda_ec,
+            )
+            if loss_ec is not None:
+                loss = loss + loss_ec
+
             # --------------------------------------------------------------
 
             # 5) Backward + optimizer step
@@ -680,6 +762,8 @@ def train_loop(
                 log_payload["train/loss_rpn"] = loss_rpn.item()
             if 'loss_rpn_value' in locals() and loss_rpn_value is not None:
                 log_payload["train/loss_rpn_value"] = float(loss_rpn_value.item())
+            if 'loss_ec' in locals() and loss_ec is not None:
+                log_payload["train/loss_ec"] = float(loss_ec.item())
             wandb.log(log_payload)
 
             # --------------------------------------------------------------
