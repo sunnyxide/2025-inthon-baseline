@@ -505,7 +505,9 @@ def train_loop(
     pbar = tqdm(total=train_config.max_train_steps if train_config.max_train_steps is not None else None, desc="train", unit="step", ncols=120, dynamic_ncols=True, leave=True)
 
     # best EM 추적용 변수 (None이 아니면 개선 시 모델 저장)
-    best_em = float("-inf")
+    # Developer log: initial_best_em이 제공되면 체크포인트에서 로드한 best_em 사용
+    initial_best_em = getattr(train_config, 'initial_best_em', None)
+    best_em = initial_best_em if initial_best_em is not None else float("-inf")
     
     # Early stopping 관련 변수 (wandb sweep용)
     no_improvement_count = 0  # 개선 없는 validation 횟수
@@ -924,6 +926,7 @@ def train_loop(
                                 "model_state": model.state_dict(),
                                 "optim_state": optim.state_dict(),
                                 "step": step,
+                                "best_em": best_em,  # Developer log: best_em 저장하여 재개 시 이전 best EM 유지
                                 "train_config": train_config.__dict__,  # 학습 설정 저장
                                 "model_config": model_config.__dict__,  # 모델 설정 저장
                                 "tokenizer_config": tokenizer_config.__dict__,  # 토크나이저 설정 저장
@@ -1440,6 +1443,14 @@ def main():
 
             if "step" in checkpoint:
                 print(f"📊 Resuming from step: {checkpoint['step']}")
+            
+            # Developer log: 체크포인트에서 best_em 로드하여 train_config에 전달
+            if "best_em" in checkpoint:
+                saved_best_em = checkpoint["best_em"]
+                train_config.initial_best_em = saved_best_em
+                print(f"📈 Resuming with best EM: {saved_best_em:.3f}")
+            else:
+                print("ℹ️  No best_em found in checkpoint (old format), starting from scratch")
             
             print("=" * 70)
             print()
