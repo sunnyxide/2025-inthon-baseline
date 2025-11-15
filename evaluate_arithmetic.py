@@ -18,10 +18,11 @@ import sys
 
 # Add current directory to path for imports
 # Handle both regular Python and Colab environments
-try:
+# Developer log: Colab doesn't define __file__, so we use getcwd() as fallback
+if '__file__' in globals():
     # Regular Python environment
     current_dir = os.path.dirname(os.path.abspath(__file__))
-except NameError:
+else:
     # Colab environment (__file__ is not defined)
     current_dir = os.getcwd()
 
