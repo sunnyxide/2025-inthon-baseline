@@ -1,411 +1,688 @@
-"""Enhanced data generation with category-based distribution and augmentation"""
+"""Arithmetic data generator with category-aware curriculum and comprehensive augmentation."""
+
 from __future__ import annotations
-from typing import Dict, Any, Tuple, Optional, List
+
+from typing import Any, Dict, List, Optional, Tuple
+
 import random
 import re
 from functools import partial
+
 from torch.utils.data import DataLoader, Dataset
 
 from do_not_edit.dataloader_validator import collate_fn_with_validation
 
+# ---------------------------------------------------------------------------
+# Distribution targets (literature-backed v0 plan)
+# ---------------------------------------------------------------------------
 
-# Category distribution (v0 baseline)
 TRAINING_DISTRIBUTION = {
-    "base_calculation": 0.40,
-    "precedence": 0.20,
-    "expression_consistency": 0.25,
-    "relational": 0.10,
-    "single_number": 0.05,
+    "base_calculation": 0.20,        # Calculation Accuracy (기본 계산)
+    "precedence": 0.15,              # Calculation Accuracy (연산 우선순위)
+    "law_preservation": 0.18,        # Law Preservation (교환/결합 법칙)
+    "expression_consistency": 0.20,  # Expression Consistency (표현 일관성)
+    "relational": 0.07,              # Relational Consistency (관계성)
+    "long_expression": 0.10,         # 긴 수식/연속 연산 집중
+    "complex_nested": 0.10,          # 복잡 중첩/괄호 패턴
 }
 
-# Phase-based digit length distribution (within each phase)
 PHASE_DIGIT_DISTRIBUTION = {
-    1: {1: 0.4, 2: 0.6},  # Phase 1: 1-2 digits
-    2: {2: 0.4, 3: 0.6},  # Phase 2: 2-3 digits
-    3: {3: 0.4, 4: 0.6},  # Phase 3: 3-4 digits
-    4: {4: 0.4, 5: 0.6},  # Phase 4: 4-5 digits
+    1: {1: 0.4, 2: 0.6},
+    2: {2: 0.4, 3: 0.6},
+    3: {3: 0.4, 4: 0.6},
+    4: {4: 0.4, 5: 0.6},
 }
 
-# Output 6+ digit ratio per category
 OUTPUT_6DIGIT_RATIO = {
-    "base_calculation": 0.05,
-    "precedence": 0.10,
-    "expression_consistency": 0.20,
-    "relational": 0.30,
-    "single_number": 0.0,
+    "base_calculation": 0.08,        # 기본 계산에서 큰 출력
+    "precedence": 0.12,              # 연산 우선순위에서 큰 출력
+    "law_preservation": 0.15,        # 법칙 보존에서 큰 출력
+    "expression_consistency": 0.20,  # 표현 일관성에서 큰 출력
+    "relational": 0.25,              # 관계성에서 큰 출력
 }
 
-# Phase-based augmentation probability (리뷰 반영: Phase별 증강 비율 조정)
-# Phase 1-2: 낮은 증강 (기본기 안정화), Phase 3: 높은 증강, Phase 4: 중간 증강
 PHASE_AUGMENTATION_PROB = {
-    1: 0.05,  # Phase 1: 5% (기본기 안정화)
-    2: 0.10,  # Phase 2: 10%
-    3: 0.25,  # Phase 3: 25% (증강 강화)
-    4: 0.15,  # Phase 4: 15% (상기 정도)
+    1: 0.15,  # Phase 1: 15% 증강 (기초 단계)
+    2: 0.25,  # Phase 2: 25% 증강 (중급)
+    3: 0.30,  # Phase 3: 30% 증강 (고급)
+    4: 0.20,  # Phase 4: 20% 증강 (큰 숫자는 증강 줄임)
 }
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
 
 
 def _rand_int(rng: random.Random, num_digits: Tuple[int, int]) -> int:
-    """Generate random integer with specified digit range (no leading zeros)"""
+    """Generate random integer with specified digit length."""
     lo, hi = num_digits
-    n = rng.randint(lo, hi)
-    if n == 1:
+    digits = rng.randint(lo, hi)
+    if digits == 1:
         return rng.randint(0, 9)
     first = rng.randint(1, 9)
-    rest = [rng.randint(0, 9) for _ in range(n - 1)]
-    return int(str(first) + "".join(str(x) for x in rest))
+    rest = [rng.randint(0, 9) for _ in range(digits - 1)]
+    return int(str(first) + "".join(str(d) for d in rest))
 
 
 def _sample_category(rng: random.Random) -> str:
-    """Sample category based on training distribution"""
+    """Sample category based on distribution."""
     r = rng.random()
     cumsum = 0.0
     for cat, prob in TRAINING_DISTRIBUTION.items():
         cumsum += prob
         if r <= cumsum:
             return cat
-    return "base_calculation"  # fallback
+    return "base_calculation"
 
 
 def _sample_digit_length(rng: random.Random, phase: int) -> int:
-    """Sample digit length based on phase distribution"""
-    dist = PHASE_DIGIT_DISTRIBUTION.get(phase, {4: 0.5, 5: 0.5})
+    """Sample digit length based on phase."""
+    dist = PHASE_DIGIT_DISTRIBUTION.get(phase, PHASE_DIGIT_DISTRIBUTION[4])
     r = rng.random()
     cumsum = 0.0
     for digits, prob in dist.items():
         cumsum += prob
         if r <= cumsum:
             return digits
-    return 4  # fallback
+    return max(dist, key=dist.get)
 
 
-def _should_generate_6digit_output(rng: random.Random, category: str) -> bool:
-    """Check if we should generate 6+ digit output for this category"""
-    ratio = OUTPUT_6DIGIT_RATIO.get(category, 0.0)
-    return rng.random() < ratio
+def _should_force_large_output(rng: random.Random, category: str) -> bool:
+    """Check if we should force large output (6+ digits)."""
+    return rng.random() < OUTPUT_6DIGIT_RATIO.get(category, 0.0)
 
 
-def _gen_base_calculation(
-    rng: random.Random, digit_len: int, force_6digit_output: bool = False
-) -> Tuple[str, int]:
-    """Generate base calculation expressions (no parentheses, no augmentation)"""
-    # Operator distribution within base_calculation
-    op_weights = {"+": 0.40, "-": 0.25, "*": 0.25, "//": 0.10}
-    
-    if force_6digit_output:
-        # Force large output: use multiplication or large addition
-        if rng.random() < 0.7:
-            # Large multiplication: 4-5 digit * 2-3 digit
-            a = _rand_int(rng, (4, 5))
-            b = _rand_int(rng, (2, 3))
-            expr = f"{a}*{b}"
-            val = a * b
+# ---------------------------------------------------------------------------
+# Augmentation utilities
+# ---------------------------------------------------------------------------
+
+
+def _apply_distributive_law(
+    expr: str, val: int, rng: random.Random
+) -> Optional[Tuple[str, int]]:
+    """Apply distributive law: a*(b+c) → a*b+a*c."""
+    # Match a*(b±c) or (b±c)*a
+    match = re.match(r'^(\d+)\*\((\d+)([\+\-])(\d+)\)$', expr)
+    if not match:
+        match = re.match(r'^\((\d+)([\+\-])(\d+)\)\*(\d+)$', expr)
+        if match:
+            b, op, c, a = match.groups()
+            a, b, c = int(a), int(b), int(c)
         else:
-            # Large addition: 4-5 digit + 4-5 digit
-            a = _rand_int(rng, (4, 5))
-            b = _rand_int(rng, (4, 5))
-            expr = f"{a}+{b}"
-            val = a + b
+            return None
     else:
-        # Normal generation: 2-4 terms
-        num_terms = rng.randint(2, 4)
-        terms = []
-        values = []
-        
-        for i in range(num_terms):
-            v = _rand_int(rng, (1, digit_len))
-            terms.append(str(v))
-            values.append(v)
-        
-        # Select operators
-        ops = []
-        for i in range(num_terms - 1):
-            op = rng.choices(
-                list(op_weights.keys()),
-                weights=list(op_weights.values()),
-                k=1
-            )[0]
-            ops.append(op)
-        
-        # Build expression respecting operator precedence
-        # Group * and // first, then + and -
-        expr = terms[0]
-        val = values[0]
-        
-        for i, op in enumerate(ops):
-            next_val = values[i + 1]
-            if op == "+":
-                expr = f"{expr}+{terms[i+1]}"
-                val = val + next_val
-            elif op == "-":
-                if val < next_val:
-                    # Swap to avoid negative
-                    expr = f"{terms[i+1]}-{expr}"
-                    val = next_val - val
-                else:
-                    expr = f"{expr}-{terms[i+1]}"
-                    val = val - next_val
-            elif op == "*":
-                expr = f"{expr}*{terms[i+1]}"
-                val = val * next_val
-            elif op == "//":
-                if next_val == 0:
-                    next_val = rng.randint(1, 9)
-                    terms[i+1] = str(next_val)
-                expr = f"{expr}//{terms[i+1]}"
-                val = val // next_val
+        a, b, op, c = match.groups()
+        a, b, c = int(a), int(b), int(c)
     
-    return expr, val
+    # Apply distributive law
+    if op == '+':
+        new_expr = f"{a}*{b}+{a}*{c}"
+        new_val = a * b + a * c
+    else:  # op == '-'
+        new_expr = f"{a}*{b}-{a}*{c}"
+        new_val = a * b - a * c
+    
+    if new_val == val:
+        return new_expr, new_val
+    return None
 
 
-def _gen_precedence(
-    rng: random.Random, digit_len: int, force_6digit_output: bool = False
-) -> Tuple[str, int]:
-    """Generate expressions with parentheses to test precedence"""
-    if force_6digit_output:
-        # Large output with parentheses: use large numbers and multiplication
-        a = _rand_int(rng, (4, 5))
-        b = _rand_int(rng, (2, 3))
-        c = _rand_int(rng, (2, 3))
-        if rng.random() < 0.5:
-            expr = f"({a}+{b})*{c}"
-            val = (a + b) * c
-        else:
-            expr = f"{a}*({b}+{c})"
-            val = a * (b + c)
-    else:
-        # Normal precedence patterns: use smaller numbers to avoid large outputs
-        # Limit to addition/subtraction patterns or small multiplications
-        if rng.random() < 0.6:
-            # Addition/subtraction with parentheses (smaller results)
-            a = _rand_int(rng, (1, min(3, digit_len)))
-            b = _rand_int(rng, (1, min(3, digit_len)))
-            c = _rand_int(rng, (1, min(3, digit_len)))
-            if rng.random() < 0.5:
-                expr = f"({a}+{b})-{c}"
-                val = (a + b) - c
-                if val < 0:
-                    expr = f"({a}+{b})+{c}"
-                    val = (a + b) + c
-            else:
-                expr = f"{a}+({b}+{c})"
-                val = a + (b + c)
-        else:
-            # Small multiplication patterns (limit to avoid large outputs)
-            a = _rand_int(rng, (1, min(2, digit_len)))
-            b = _rand_int(rng, (1, min(2, digit_len)))
-            c = _rand_int(rng, (1, min(2, digit_len)))
-            if rng.random() < 0.5:
-                expr = f"({a}+{b})*{c}"
-                val = (a + b) * c
-            else:
-                expr = f"{a}*({b}+{c})"
-                val = a * (b + c)
-    
-    return expr, val
+def _apply_identity_augmentation(
+    expr: str, val: int, rng: random.Random
+) -> Optional[Tuple[str, int]]:
+    """Apply identity augmentation: expr → expr+0, expr-0, expr*1, 0+expr."""
+    augmentations = [
+        (f"{expr}+0", val),
+        (f"0+{expr}", val),
+        (f"{expr}-0", val),
+        (f"{expr}*1", val),
+        (f"1*{expr}", val),
+    ]
+    return rng.choice(augmentations)
 
 
-def _gen_expression_consistency_base(
-    rng: random.Random, digit_len: int, force_6digit_output: bool = False
-) -> Tuple[str, int]:
-    """Generate base expression for consistency (commutative/associative laws)"""
-    if force_6digit_output:
-        # Large commutative pairs
-        a = _rand_int(rng, (4, 5))
-        b = _rand_int(rng, (2, 3))
-        if rng.random() < 0.5:
-            expr = f"{a}*{b}"
-            val = a * b
-        else:
-            expr = f"{a}+{b}"
-            val = a + b
-    else:
-        # Simple 2-term expressions (will be augmented)
-        op = rng.choice(["+", "*"])
-        a = _rand_int(rng, (1, digit_len))
-        b = _rand_int(rng, (1, digit_len))
-        expr = f"{a}{op}{b}"
-        if op == "+":
-            val = a + b
-        elif op == "*":
-            val = a * b
-        else:
-            val = 0  # fallback
-    
-    return expr, val
-
-
-def _safe_augment_expression(expr: str, val: int, rng: random.Random) -> Optional[Tuple[str, int]]:
-    """Safely augment expression using commutative/associative laws (only for expression_consistency)"""
-    # Only augment simple 2-term expressions without parentheses
-    if "(" in expr or ")" in expr:
-        return None
-    
-    # Tokenize: numbers and operators
-    tokens = re.findall(r'\d+|[\+\-\*//]', expr)
-    if len(tokens) != 3:  # num op num
-        return None
-    
-    num1_str, op, num2_str = tokens
-    
-    # Only commutative operations
-    if op in ["+", "*"]:
-        try:
-            num1 = int(num1_str)
-            num2 = int(num2_str)
-            # Commutative: a+b -> b+a, a*b -> b*a
-            new_expr = f"{num2}{op}{num1}"
-            if op == "+":
-                new_val = num2 + num1
-            elif op == "*":
-                new_val = num2 * num1
-            else:
+def _apply_commutative_law(
+    expr: str, val: int, rng: random.Random
+) -> Optional[Tuple[str, int]]:
+    """Apply commutative law for simple expressions: a+b → b+a, a*b → b*a."""
+    # Match simple binary expressions without parentheses
+    tokens = re.findall(r'\d+|[\+\*]', expr)
+    if len(tokens) == 3 and '(' not in expr:
+        lhs, op, rhs = tokens
+        if op in ['+', '*']:
+            try:
+                left = int(lhs)
+                right = int(rhs)
+                swapped = f"{right}{op}{left}"
+                new_val = right + left if op == '+' else right * left
+                if new_val == val:
+                    return swapped, new_val
+            except ValueError:
                 return None
-            
-            if new_val == val:  # Verify equivalence
-                return new_expr, new_val
-        except (ValueError, TypeError):
-            pass
+    return None
+
+
+def _apply_associative_law(
+    expr: str, val: int, rng: random.Random
+) -> Optional[Tuple[str, int]]:
+    """Apply associative law: (a+b)+c → a+(b+c), (a*b)*c → a*(b*c)."""
+    match = re.match(r'^\((\d+)([\+\*])(\d+)\)([\+\*])(\d+)$', expr)
+    if not match:
+        return None
+    a_str, op1, b_str, op2, c_str = match.groups()
+    if op1 != op2:
+        return None
+    if op1 not in ['+', '*']:
+        return None
+    a, b, c = int(a_str), int(b_str), int(c_str)
+    if op1 == '+':
+        new_expr = f"{a}+({b}+{c})"
+        new_val = a + (b + c)
+    else:
+        new_expr = f"{a}*({b}*{c})"
+        new_val = a * (b * c)
+    if new_val == val:
+        return new_expr, new_val
+    return None
+
+
+def _safe_augment_expression(
+    expr: str,
+    val: int,
+    rng: random.Random,
+) -> Optional[Tuple[str, int]]:
+    """
+    Apply various augmentation strategies with proper probability distribution.
+    Developer log: Comprehensive augmentation including distributive, commutative, 
+    associative laws and identity operations.
+    """
+    # List of augmentation strategies
+    strategies = [
+        _apply_commutative_law,      # a+b → b+a, a*b → b*a
+        _apply_associative_law,      # (a+b)+c → a+(b+c)
+        _apply_distributive_law,     # a*(b+c) → a*b+a*c
+        _apply_identity_augmentation, # expr → expr+0, expr*1
+    ]
     
-    # Associative: (a+b)+c -> a+(b+c) for 3+ terms (future extension)
-    # For now, only commutative
+    # Try strategies in random order
+    rng.shuffle(strategies)
+    for strategy in strategies:
+        result = strategy(expr, val, rng)
+        if result is not None:
+            return result
     
     return None
 
 
-def _gen_relational(
-    rng: random.Random, digit_len: int, force_6digit_output: bool = False
+# ---------------------------------------------------------------------------
+# Category generators
+# ---------------------------------------------------------------------------
+
+
+def _gen_base_calculation(
+    rng: random.Random,
+    digit_len: int,
+    force_large: bool = False,
 ) -> Tuple[str, int]:
-    """Generate relational expressions (A+0, A*1, A+1, etc.)"""
-    if force_6digit_output:
-        # For 6-digit output: use large base value with multiplication
-        base_val = _rand_int(rng, (4, 5))
-        # Use multiplication patterns to ensure large output
-        # Try 2-digit multiplier first
-        multiplier = rng.randint(10, 99)  # 2-digit multiplier
-        val = base_val * multiplier
-        # If result is too small, use 3-digit multiplier
-        if val < 100000:
-            multiplier = rng.randint(100, 999)  # 3-digit multiplier (within 1-5 digit constraint)
-            expr = f"{base_val}*{multiplier}"
-            val = base_val * multiplier
-        else:
-            expr = f"{base_val}*{multiplier}"
-    else:
-        # Normal relational patterns with smaller values
-        base_val = _rand_int(rng, (1, digit_len))
-        
-        patterns = [
-            # Identity: A+0, 0+A
-            (f"{base_val}+0", base_val),
-            (f"0+{base_val}", base_val),
-            # Identity: A*1, 1*A
-            (f"{base_val}*1", base_val),
-            (f"1*{base_val}", base_val),
-            # Zero: A*0, 0*A
-            (f"{base_val}*0", 0),
-            (f"0*{base_val}", 0),
-            # Increment: A+1, A+2
-            (f"{base_val}+1", base_val + 1),
-            (f"{base_val}+2", base_val + 2),
-        ]
-        
-        expr, val = rng.choice(patterns)
+    """Generate basic calculation expressions with proper operator precedence."""
+    if force_large:
+        if rng.random() < 0.7:
+            a = _rand_int(rng, (4, 5))
+            b = _rand_int(rng, (2, 3))
+            return f"{a}*{b}", a * b
+        a = _rand_int(rng, (4, 5))
+        b = _rand_int(rng, (4, 5))
+        return f"{a}+{b}", a + b
     
-    return expr, val
+    # 12% 확률로 긴 수식 생성 (숫자 5개 이상) - 다양성 확대
+    if rng.random() < 0.12:
+        return _gen_long_expression(rng, digit_len)
+
+    def make_number() -> Tuple[str, int]:
+        v = _rand_int(rng, (1, digit_len))
+        return str(v), v
+
+    def make_term(depth: int) -> Tuple[str, int]:
+        if depth == 0 or rng.random() < 0.5:
+            return make_number()
+        op = rng.choice(["*", "//"])
+        left_expr, left_val = make_term(rng.randint(0, depth - 1))
+        right_expr, right_val = make_number()
+        if op == "//" and right_val == 0:
+            right_val = rng.randint(1, 9)
+            right_expr = str(right_val)
+        val = left_val // right_val if op == "//" else left_val * right_val
+        return f"{left_expr}{op}{right_expr}", val
+
+    def make_expr(depth: int) -> Tuple[str, int]:
+        if depth == 0 or rng.random() < 0.5:
+            return make_term(depth)
+        op = rng.choice(["+", "-"])
+        left_expr, left_val = make_expr(rng.randint(0, depth - 1))
+        right_expr, right_val = make_term(rng.randint(0, depth - 1))
+        
+        # Prevent negative results - ensure left >= right for subtraction
+        if op == "-":
+            if left_val < right_val:
+                left_expr, right_expr = right_expr, left_expr
+                left_val, right_val = right_val, left_val
+            # Additional check for nested expressions
+            if left_val < right_val:
+                op = "+"  # Fallback to addition
+        
+        val = left_val + right_val if op == "+" else left_val - right_val
+        return f"{left_expr}{op}{right_expr}", val
+
+    depth = rng.randint(1, 2)
+    expr, value = make_expr(depth)
+    return expr, value
+
+
+def _gen_long_expression(
+    rng: random.Random,
+    digit_len: int,
+) -> Tuple[str, int]:
+    """Generate long expressions with 5+ numbers for improved generalization."""
+    num_count = rng.randint(5, 7)  # 5-7개의 숫자
+    numbers = [_rand_int(rng, (1, min(3, digit_len))) for _ in range(num_count)]
+    
+    # 연산자 선택 (혼합)
+    ops = []
+    for _ in range(num_count - 1):
+        if rng.random() < 0.6:
+            ops.append(rng.choice(["+", "-"]))
+        else:
+            ops.append(rng.choice(["*", "//"]))
+    
+    # 수식 구성
+    expr_parts = [str(numbers[0])]
+    val = numbers[0]
+    
+    for i, op in enumerate(ops):
+        num = numbers[i + 1]
+        if op == "//":
+            if num == 0:
+                num = rng.randint(1, 9)
+            expr_parts.append(f"//{num}")
+            val = val // num
+        elif op == "*":
+            expr_parts.append(f"*{num}")
+            val = val * num
+        elif op == "+":
+            expr_parts.append(f"+{num}")
+            val = val + num
+        else:  # "-"
+            if val >= num:
+                expr_parts.append(f"-{num}")
+                val = val - num
+            else:
+                expr_parts.append(f"+{num}")
+                val = val + num
+    
+    return "".join(expr_parts), val
+
+
+def _gen_law_preservation(
+    rng: random.Random,
+    digit_len: int,
+    force_large: bool = False,
+) -> Tuple[str, int]:
+    """
+    Generate expressions that test law preservation (commutative, associative).
+    Developer log: 교환법칙, 결합법칙 테스트를 위한 데이터 생성.
+    """
+    if force_large:
+        a = _rand_int(rng, (4, 5))
+        b = _rand_int(rng, (2, 3))
+        c = _rand_int(rng, (2, 3))
+        pattern = rng.choice(["commutative", "associative"])
+        if pattern == "commutative":
+            # 교환법칙: a+b or a*b (순서만 다름)
+            if rng.random() < 0.5:
+                return f"{a}+{b}", a + b  # 다른 곳에서 b+a 생성될 것
+            return f"{a}*{b}", a * b
+        else:
+            # 결합법칙: (a+b)+c or a+(b+c)
+            if rng.random() < 0.5:
+                return f"({a}+{b})+{c}", (a + b) + c
+            return f"{a}*({b}+{c})", a * (b + c)
+    
+    pattern_choice = rng.random()
+    
+    if pattern_choice < 0.4:
+        # 교환법칙 테스트: 덧셈
+        a = _rand_int(rng, (1, min(3, digit_len)))
+        b = _rand_int(rng, (1, min(3, digit_len)))
+        if rng.random() < 0.5:
+            return f"{a}+{b}", a + b
+        return f"{b}+{a}", b + a
+    
+    elif pattern_choice < 0.7:
+        # 교환법칙 테스트: 곱셈
+        a = _rand_int(rng, (1, min(2, digit_len)))
+        b = _rand_int(rng, (1, min(2, digit_len)))
+        if rng.random() < 0.5:
+            return f"{a}*{b}", a * b
+        return f"{b}*{a}", b * a
+    
+    else:
+        # 결합법칙 테스트
+        a = _rand_int(rng, (1, min(2, digit_len)))
+        b = _rand_int(rng, (1, min(2, digit_len)))
+        c = _rand_int(rng, (1, min(2, digit_len)))
+        
+        if rng.random() < 0.5:
+            # 덧셈 결합법칙
+            if rng.random() < 0.5:
+                return f"({a}+{b})+{c}", (a + b) + c
+            return f"{a}+({b}+{c})", a + (b + c)
+        else:
+            # 곱셈 결합법칙
+            if rng.random() < 0.5:
+                return f"({a}*{b})*{c}", (a * b) * c
+            return f"{a}*({b}*{c})", a * (b * c)
+
+
+def _gen_precedence(
+    rng: random.Random,
+    digit_len: int,
+    force_large: bool = False,
+) -> Tuple[str, int]:
+    """
+    Generate precedence-focused expressions with diverse patterns.
+    Developer log: Added more diverse precedence patterns including (a*b)+c.
+    """
+    if force_large:
+        a = _rand_int(rng, (4, 5))
+        b = _rand_int(rng, (2, 3))
+        c = _rand_int(rng, (2, 3))
+        if rng.random() < 0.5:
+            return f"({a}+{b})*{c}", (a + b) * c
+        return f"{a}*({b}+{c})", a * (b + c)
+
+    # More diverse precedence patterns
+    pattern_choice = rng.random()
+    
+    if pattern_choice < 0.3:
+        # Addition/subtraction with parentheses
+        a = _rand_int(rng, (1, min(3, digit_len)))
+        b = _rand_int(rng, (1, min(3, digit_len)))
+        c = _rand_int(rng, (1, min(3, digit_len)))
+        if rng.random() < 0.5:
+            val = (a + b) - c
+            if val < 0:
+                val = (a + b) + c
+                return f"({a}+{b})+{c}", val
+            return f"({a}+{b})-{c}", val
+        return f"{a}+({b}+{c})", a + (b + c)
+    
+    elif pattern_choice < 0.6:
+        # Multiplication with addition/subtraction in parentheses
+        a = _rand_int(rng, (1, min(2, digit_len)))
+        b = _rand_int(rng, (1, min(2, digit_len)))
+        c = _rand_int(rng, (1, min(2, digit_len)))
+        if rng.random() < 0.5:
+            return f"({a}+{b})*{c}", (a + b) * c
+        return f"{a}*({b}+{c})", a * (b + c)
+    
+    else:
+        # Multiplication precedence: (a*b)+c or a+(b*c)
+        a = _rand_int(rng, (1, min(2, digit_len)))
+        b = _rand_int(rng, (1, min(2, digit_len)))
+        c = _rand_int(rng, (1, min(2, digit_len)))
+        if rng.random() < 0.5:
+            return f"({a}*{b})+{c}", (a * b) + c
+        return f"{a}+({b}*{c})", a + (b * c)
+
+
+def _gen_expression_consistency_base(
+    rng: random.Random,
+    digit_len: int,
+    force_large: bool = False,
+) -> Tuple[str, int]:
+    """Generate expressions for consistency testing."""
+    if force_large:
+        a = _rand_int(rng, (4, 5))
+        b = _rand_int(rng, (2, 3))
+        if rng.random() < 0.5:
+            return f"{a}*{b}", a * b
+        return f"{a}+{b}", a + b
+
+    if rng.random() < 0.6:
+        op = rng.choice(["+", "*"])
+        a = _rand_int(rng, (1, digit_len))
+        b = _rand_int(rng, (1, digit_len))
+        expr = f"{a}{op}{b}"
+        val = a + b if op == "+" else a * b
+        return expr, val
+
+    op = rng.choice(["+", "*"])
+    a = _rand_int(rng, (1, digit_len))
+    b = _rand_int(rng, (1, digit_len))
+    c = _rand_int(rng, (1, digit_len))
+    if op == "+":
+        return f"({a}+{b})+{c}", (a + b) + c
+    return f"({a}*{b})*{c}", (a * b) * c
+
+
+def _gen_relational(
+    rng: random.Random,
+    digit_len: int,
+    force_large: bool = False,
+) -> Tuple[str, int]:
+    """
+    Generate relational patterns focusing on identities.
+    Developer log: Removed single number pattern to avoid overlap with single_number category.
+    """
+    if force_large:
+        base = _rand_int(rng, (4, 5))
+        mul = rng.randint(50, 999)
+        return f"{base}*{mul}", base * mul
+
+    base = _rand_int(rng, (1, digit_len))
+    # Removed (f"{base}", base) to avoid overlap
+    patterns = [
+        (f"{base}+0", base),
+        (f"0+{base}", base),
+        (f"{base}*1", base),
+        (f"1*{base}", base),
+        (f"{base}*0", 0),
+        (f"0*{base}", 0),
+        (f"{base}+1", base + 1),
+        (f"{base}+2", base + 2),
+    ]
+    return rng.choice(patterns)
+
+
+def _gen_complex_nested(
+    rng: random.Random,
+    digit_len: int,
+    force_large: bool = False,
+) -> Tuple[str, int]:
+    """
+    Generate complex nested expressions by composing existing generators.
+    Developer log: Mixes precedence, law, consistency segments with additional
+    outer operations to maximize structural diversity.
+    """
+    segment_generators = [
+        _gen_precedence,
+        _gen_law_preservation,
+        _gen_expression_consistency_base,
+        _gen_relational,
+        _gen_base_calculation,
+    ]
+    seg_count = 4 if force_large else rng.randint(3, 4)
+    segments: List[Tuple[str, int]] = []
+    for _ in range(seg_count):
+        gen = rng.choice(segment_generators)
+        seg_expr, seg_val = gen(
+            rng,
+            min(5, digit_len + (1 if force_large else 0)),
+            force_large,
+        )
+        segments.append((seg_expr, seg_val))
+    
+    expr, value = segments[0]
+    for seg_expr, seg_val in segments[1:]:
+        op = rng.choice(["+", "-", "*"])
+        if op == "-":
+            if value < seg_val:
+                expr, seg_expr = seg_expr, expr
+                value, seg_val = seg_val, value
+            value -= seg_val
+        elif op == "+":
+            value += seg_val
+        else:
+            value *= seg_val
+        expr = f"({expr}){op}({seg_expr})"
+    
+    if rng.random() < 0.5:
+        booster = _rand_int(rng, (3, 5)) if force_large else _rand_int(rng, (1, digit_len))
+        if rng.random() < 0.5:
+            expr = f"{booster}*({expr})"
+            value *= booster
+        else:
+            expr = f"({expr})+{booster}"
+            value += booster
+    
+    return expr, value
 
 
 def _gen_single_number(
-    rng: random.Random, digit_len: int, force_6digit_output: bool = False
+    rng: random.Random,
+    digit_len: int,
+    force_large: bool = False,
 ) -> Tuple[str, int]:
-    """Generate single number (no operation)"""
-    if force_6digit_output:
-        # 5-digit number (max allowed input)
-        val = _rand_int(rng, (5, 5))
-    else:
-        val = _rand_int(rng, (1, digit_len))
-    expr = str(val)
-    return expr, val
+    """Generate single number (for curriculum completeness)."""
+    val = _rand_int(rng, (5, 5)) if force_large else _rand_int(rng, (1, digit_len))
+    text = str(val)
+    return text, val
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 
 
 class ArithmeticDataset(Dataset):
-    """Enhanced arithmetic dataset with category-based distribution and augmentation"""
+    """
+    Arithmetic dataset with category-aware curriculum and comprehensive augmentation.
+    Developer log: Supports phase, phase_mix, max_depth parameters for backward compatibility.
+    """
     
     def __init__(
         self,
         num_samples: int,
-        phase: int = 4,  # Phase 1-4: (1-2), (2-3), (3-4), (4-5) digits
+        phase: Optional[int] = None,
         seed: int = 42,
         mode: str = "train",
-        enable_augmentation: bool = True,  # Enable augmentation for expression_consistency
+        enable_augmentation: bool = True,
+        num_digits: Optional[Tuple[int, int]] = None,
+        max_depth: Optional[int] = None,
+        phase_mix: Optional[Tuple[int, ...]] = None,
     ):
-        """
-        Args:
-            num_samples: Total number of samples
-            phase: Phase number (1-4) determining digit length distribution
-            seed: Random seed
-            mode: "train" or "val"
-            enable_augmentation: Whether to apply augmentation for expression_consistency
-        """
         self.num_samples = num_samples
-        self.phase = phase
         self.seed = seed
         self.mode = mode
         self.enable_augmentation = enable_augmentation
-        
-        # Pre-compute category cumulative distribution for efficient sampling
-        self._category_cumsum = []
-        cumsum = 0.0
+
+        if phase is None:
+            if max_depth is not None:
+                # max_depth를 직접 phase로 변환 (더 직관적)
+                # max_depth=2 → phase=2 (2-3자리 숫자 생성)
+                phase = min(max(1, max_depth), 4)
+            elif num_digits is not None:
+                # num_digits를 phase로 변환
+                _, max_digits = num_digits
+                if max_digits <= 2:
+                    phase = 1
+                elif max_digits <= 3:
+                    phase = 2
+                elif max_digits <= 4:
+                    phase = 3
+                else:
+                    phase = 4
+            else:
+                phase = 4
+        if phase_mix is not None and len(phase_mix) > 0:
+            normalized = tuple(
+                sorted(
+                    {
+                        max(1, min(4, int(p)))
+                        for p in phase_mix
+                    }
+                )
+            )
+            self.phase_pool = normalized or (phase,)
+            self.phase = self.phase_pool[0]
+        else:
+            self.phase = phase
+            self.phase_pool = (self.phase,)
+
+        self._category_cumsum: List[Tuple[float, str]] = []
+        cumulative = 0.0
         for cat, prob in TRAINING_DISTRIBUTION.items():
-            cumsum += prob
-            self._category_cumsum.append((cumsum, cat))
-    
+            cumulative += prob
+            self._category_cumsum.append((cumulative, cat))
+
     def __len__(self) -> int:
         return self.num_samples
-    
+
+    def _sample_category(self, rng: random.Random) -> str:
+        r = rng.random()
+        for threshold, cat in self._category_cumsum:
+            if r <= threshold:
+                return cat
+        return self._category_cumsum[-1][1]
+
+    def _sample_phase(self, rng: random.Random) -> int:
+        if len(self.phase_pool) == 1:
+            return self.phase_pool[0]
+        return rng.choice(self.phase_pool)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         rng = random.Random(self.seed + idx)
-        
-        # 1) Sample category
-        category = _sample_category(rng)
-        
-        # 2) Sample digit length based on phase
-        digit_len = _sample_digit_length(rng, self.phase)
-        
-        # 3) Check if we should generate 6+ digit output
-        force_6digit = _should_generate_6digit_output(rng, category)
-        
-        # 4) Generate expression based on category
+        category = self._sample_category(rng)
+        sample_phase = self._sample_phase(rng)
+        digit_len = _sample_digit_length(rng, sample_phase)
+        force_large = _should_force_large_output(rng, category)
+
+        # Generate base expression
         if category == "base_calculation":
-            expr, val = _gen_base_calculation(rng, digit_len, force_6digit)
+            expr, val = _gen_base_calculation(rng, digit_len, force_large)
         elif category == "precedence":
-            expr, val = _gen_precedence(rng, digit_len, force_6digit)
+            expr, val = _gen_precedence(rng, digit_len, force_large)
+        elif category == "law_preservation":
+            expr, val = _gen_law_preservation(rng, digit_len, force_large)
         elif category == "expression_consistency":
-            expr, val = _gen_expression_consistency_base(rng, digit_len, force_6digit)
-            # Apply augmentation with phase-based probability (리뷰 반영)
-            augment_prob = PHASE_AUGMENTATION_PROB.get(self.phase, 0.15)  # default 15%
-            if self.enable_augmentation and rng.random() < augment_prob:
-                augmented = _safe_augment_expression(expr, val, rng)
-                if augmented is not None:
-                    expr, val = augmented
+            expr, val = _gen_expression_consistency_base(rng, digit_len, force_large)
         elif category == "relational":
-            expr, val = _gen_relational(rng, digit_len, force_6digit)
-        elif category == "single_number":
-            expr, val = _gen_single_number(rng, digit_len, force_6digit)
+            expr, val = _gen_relational(rng, digit_len, force_large)
+        elif category == "long_expression":
+            expr, val = _gen_long_expression(rng, digit_len + 1 if force_large else digit_len)
+        elif category == "complex_nested":
+            expr, val = _gen_complex_nested(rng, digit_len, force_large)
         else:
-            # Fallback to base_calculation
-            expr, val = _gen_base_calculation(rng, digit_len, force_6digit)
+            expr, val = _gen_base_calculation(rng, digit_len, force_large)
             category = "base_calculation"
-        
+
+        # Apply augmentation with appropriate probability
+        if self.enable_augmentation:
+            augment_prob = PHASE_AUGMENTATION_PROB.get(sample_phase, 0.15)
+            if rng.random() < augment_prob:
+                augmented = _safe_augment_expression(expr, val, rng)
+                if augmented:
+                    expr, val = augmented
+
         return {
             "input_text": expr,
             "target_text": str(val),
             "meta": {
                 "category": category,
-                "phase": self.phase,
+                "phase": sample_phase,
                 "digit_len": digit_len,
                 "output_6digit": len(str(val)) >= 6,
-            }
+            },
         }
 
 
@@ -416,10 +693,11 @@ def get_dataloader(
     pin_memory: bool = False,
     mode: str = "train",
 ) -> DataLoader:
-    """Create DataLoader with automatic validation for training mode"""
-    is_training = (getattr(dataset, "mode", mode) == "train")
-    collate_fn = partial(collate_fn_with_validation, is_training=is_training) if is_training else None
-    
+    """Create DataLoader with validation collate function."""
+    is_training = getattr(dataset, "mode", mode) == "train"
+    collate_fn = (
+        partial(collate_fn_with_validation, is_training=True) if is_training else None
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,

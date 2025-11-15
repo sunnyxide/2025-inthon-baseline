@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 from dataclasses import dataclass
 
@@ -474,6 +474,17 @@ class TransformerSeq2Seq(nn.Module):
         # 출력 projection
         self.out_proj = nn.Linear(d_model, out_vocab)
 
+        # RPN auxiliary decoder/projection (훈련 전용)
+        rpn_decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.rpn_decoder = nn.TransformerDecoder(rpn_decoder_layer, num_layers=num_decoder_layers)
+        self.rpn_out = nn.Linear(d_model, out_vocab)
+
     def forward(
         self,
         src: torch.Tensor,       # [B, S]
@@ -519,6 +530,59 @@ class TransformerSeq2Seq(nn.Module):
 
         logits = self.out_proj(dec_out)  # [B, T, out_vocab]
         return logits
+
+    def forward_with_rpn(
+        self,
+        src: torch.Tensor,
+        tgt_result_inp: torch.Tensor,
+        src_pad_id: int,
+        rpn_inp: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        학습 시 결과/보조(RPN) 디코더를 동시에 실행.
+        Returns:
+            result_logits: [B, T_res, out_vocab]
+            rpn_logits   : [B, T_rpn, out_vocab]
+        """
+        device = src.device
+        B, S = src.size()
+        _, T_result = tgt_result_inp.size()
+        _, T_rpn = rpn_inp.size()
+
+        # --- Encoder ---
+        src_emb = self.embed_in(src) * math.sqrt(self.d_model)
+        src_emb = self.pos_enc_in(src_emb)
+        src_key_padding_mask = (src == src_pad_id)
+        memory = self.encoder(
+            src_emb,
+            src_key_padding_mask=src_key_padding_mask,
+        )
+
+        # --- Result decoder ---
+        res_emb = self.embed_out(tgt_result_inp) * math.sqrt(self.d_model)
+        res_emb = self.pos_enc_out(res_emb)
+        res_mask = _generate_square_subsequent_mask(T_result, device=device)
+        res_out = self.decoder(
+            res_emb,
+            memory,
+            tgt_mask=res_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        result_logits = self.out_proj(res_out)
+
+        # --- RPN decoder (훈련 전용) ---
+        rpn_emb = self.embed_out(rpn_inp) * math.sqrt(self.d_model)
+        rpn_emb = self.pos_enc_out(rpn_emb)
+        rpn_mask = _generate_square_subsequent_mask(T_rpn, device=device)
+        rpn_out = self.rpn_decoder(
+            rpn_emb,
+            memory,
+            tgt_mask=rpn_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        rpn_logits = self.rpn_out(rpn_out)
+
+        return result_logits, rpn_logits
 
     @torch.no_grad()
     def generate(
