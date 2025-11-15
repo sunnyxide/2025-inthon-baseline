@@ -15,12 +15,12 @@ class TokenizerConfig:
 class ModelConfig:
     """모델 아키텍처 관련 설정 (EC enhanced baseline)"""
     d_model: int = 256  # Hidden dimension (checkpoint 호환 유지)
-    nhead: int = 4  # Attention heads (2 → 4: 복잡한 패턴 학습 강화)
+    nhead: int = 2  # Attention heads (checkpoint 호환 - nhead 변경 시 weight 재사용 불가)
     num_encoder_layers: int = 8  # Encoder layers (6 → 8: 긴 dependency 처리)
     num_decoder_layers: int = 3  # Decoder layers (2 → 3: 출력 복잡도 대응)
     dim_feedforward: int = 1024  # FFN dimension (유지)
     dropout: float = 0.0  # Dropout (유지: 과적합 없음)
-    # 연산자 1-4개 수식 처리를 위한 capacity 증가
+    # 기존 6 enc + 2 dec layers는 checkpoint 활용, 추가 2 enc + 1 dec는 random init
 
 DEPTH_PROFILES = {
     "baseline": {
