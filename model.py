@@ -833,26 +833,48 @@ class Model(BaseModel):
         체크포인트를 로드하고 모델을 평가 모드로 설정합니다.
         모든 초기화는 이 메서드에서 완료되어야 합니다.
         """
-        super().__init__()
+        print("🚀 Model.__init__ called - START")
+        import sys
+        sys.stdout.flush()
+        
+        try:
+            super().__init__()
+            print("✅ super().__init__() completed")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"❌ Error in super().__init__(): {e}")
+            sys.stdout.flush()
+            raise
         
         # 디바이스 설정 (CUDA 사용 가능 시 GPU, 아니면 CPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"✅ Device set to: {self.device}")
+        sys.stdout.flush()
         
         # 체크포인트 경로 (반드시 상대 경로 사용)
         CKPT_PATH = "best_model.pt"
         
         print(f"📂 Loading checkpoint from: {CKPT_PATH}")
+        sys.stdout.flush()
         
         # 체크포인트 로드
         # 체크포인트는 dict 형식일 수 있으며, "model_state" 키가 있으면 사용,
         # 없으면 전체를 state_dict로 간주
-        checkpoint = torch.load(CKPT_PATH, map_location=self.device)
-        print(f"✅ Checkpoint loaded successfully")
+        try:
+            checkpoint = torch.load(CKPT_PATH, map_location=self.device)
+            print(f"✅ Checkpoint loaded successfully")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            sys.stdout.flush()
+            raise
         
         # 토크나이저 설정 로드 (체크포인트에 저장된 설정 필수)
         # tokenizer_config가 별도로 저장된 형식만 지원
         tokenizer_config_dict = checkpoint.get("tokenizer_config")
         if tokenizer_config_dict is None:
+            print(f"❌ Checkpoint missing 'tokenizer_config'")
+            sys.stdout.flush()
             raise ValueError(f"체크포인트에 'tokenizer_config'가 없습니다.")
         
         # 토크나이저 초기화 (체크포인트에서 로드한 설정 사용)
@@ -902,24 +924,31 @@ class Model(BaseModel):
         # 모델 가중치 로드
         # Developer log: checkpoint 구조 확인 및 model_state 추출
         print("🔍 Loading model state dict...")
+        sys.stdout.flush()
         if isinstance(checkpoint, dict) and "model_state" in checkpoint:
             model_state = checkpoint["model_state"]
             print(f"   Found 'model_state' key in checkpoint")
+            sys.stdout.flush()
         elif isinstance(checkpoint, dict):
             # checkpoint 자체가 state_dict인 경우
             model_state = checkpoint
             print(f"   Checkpoint is state_dict itself")
+            sys.stdout.flush()
         else:
             # checkpoint가 state_dict인 경우
             model_state = checkpoint
             print(f"   Checkpoint is not a dict, using as-is")
+            sys.stdout.flush()
         
         # Developer log: RPN decoder는 학습 시에만 사용되며 inference에는 불필요
         # 제출용 Model 클래스에서는 RPN decoder가 없으므로 관련 키를 필터링
         if not isinstance(model_state, dict):
+            print(f"❌ model_state is not a dict: {type(model_state)}")
+            sys.stdout.flush()
             raise ValueError(f"model_state must be a dict, got {type(model_state)}")
         
         print(f"   Total keys in checkpoint: {len(model_state)}")
+        sys.stdout.flush()
         
         # RPN 관련 키 제거 (rpn_decoder, rpn_embed, rpn_out, rpn_value_out)
         filtered_state = {
@@ -930,26 +959,32 @@ class Model(BaseModel):
         # 필터링된 키 수 확인
         removed_keys = set(model_state.keys()) - set(filtered_state.keys())
         print(f"   Keys after filtering: {len(filtered_state)}")
+        sys.stdout.flush()
         if removed_keys:
             print(f"⚠️ Removed {len(removed_keys)} RPN-related keys from checkpoint (inference에 불필요)")
             # 디버깅: 처음 5개 키만 출력
             sample_keys = list(removed_keys)[:5]
             print(f"   Sample removed keys: {sample_keys}")
+            sys.stdout.flush()
         
         # strict=False로 설정하여 예상치 못한 키 무시 (방어적 처리)
         print(f"   Loading state_dict with strict=False...")
+        sys.stdout.flush()
         try:
             missing_keys, unexpected_keys = self.model.load_state_dict(filtered_state, strict=False)
             print(f"✅ State dict loaded successfully")
+            sys.stdout.flush()
             
             if missing_keys:
                 print(f"⚠️ Missing keys in model (will use random init): {len(missing_keys)} keys")
                 if len(missing_keys) <= 5:
                     print(f"   Missing keys: {missing_keys}")
+                sys.stdout.flush()
             if unexpected_keys:
                 print(f"⚠️ Unexpected keys in checkpoint (ignored): {len(unexpected_keys)} keys")
                 if len(unexpected_keys) <= 5:
                     print(f"   Unexpected keys: {unexpected_keys}")
+                sys.stdout.flush()
         except Exception as e:
             # 디버깅: 오류 발생 시 상세 정보 출력
             print(f"❌ Error loading state_dict: {e}")
@@ -962,7 +997,11 @@ class Model(BaseModel):
             if rpn_keys_in_filtered:
                 print(f"   ⚠️ WARNING: RPN keys still present in filtered_state: {len(rpn_keys_in_filtered)}")
                 print(f"   Sample: {rpn_keys_in_filtered[:5]}")
+            sys.stdout.flush()
             raise
+        
+        print("✅ Model initialization completed successfully")
+        sys.stdout.flush()
         
         # 최대 생성 길이 설정
         self.max_len = 50
