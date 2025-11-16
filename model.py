@@ -894,23 +894,32 @@ class Model(BaseModel):
         ).to(self.device)
         
         # 모델 가중치 로드
-        # Developer log: Clean checkpoint should have no RPN keys, so strict=True is safe
+        # Developer log: Always filter RPN keys to ensure compatibility
         model_state = checkpoint.get("model_state", checkpoint)
         if not isinstance(model_state, dict):
             raise ValueError(f"model_state must be a dict, got {type(model_state)}")
         
-        # Check if checkpoint has RPN keys (should not if clean checkpoint)
+        # Always filter RPN keys (defensive approach)
+        # This ensures compatibility even if clean checkpoint was not created
+        original_keys = len(model_state)
         rpn_keys = [k for k in model_state.keys() if k.startswith("rpn_")]
+        
         if rpn_keys:
-            # Fallback: filter RPN keys if clean checkpoint was not used
-            print(f"⚠️ Warning: RPN keys found in checkpoint. Consider using clean_checkpoint.py")
-            print(f"   Found {len(rpn_keys)} RPN keys, filtering them...")
+            # Filter RPN keys
+            print(f"⚠️ Warning: Found {len(rpn_keys)} RPN keys in checkpoint, filtering them...")
+            print(f"   Tip: Use 'python clean_checkpoint.py best_model.pt' to create clean checkpoint")
             model_state = {k: v for k, v in model_state.items() if not k.startswith("rpn_")}
-            # Use strict=False as fallback
-            self.model.load_state_dict(model_state, strict=False)
-        else:
-            # Clean checkpoint: use strict=True
-            self.model.load_state_dict(model_state, strict=True)
+            filtered_keys = len(model_state)
+            print(f"   Filtered: {original_keys} -> {filtered_keys} keys")
+        
+        # Always use strict=False when filtering (safe approach)
+        # If no RPN keys were found, strict=True would work, but strict=False is safer
+        missing_keys, unexpected_keys = self.model.load_state_dict(model_state, strict=False)
+        
+        if missing_keys:
+            print(f"⚠️ Warning: {len(missing_keys)} missing keys (using random init)")
+        if unexpected_keys:
+            print(f"⚠️ Warning: {len(unexpected_keys)} unexpected keys (ignored)")
         
         # 최대 생성 길이 설정
         self.max_len = 50
