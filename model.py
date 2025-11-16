@@ -897,30 +897,53 @@ class Model(BaseModel):
         ).to(self.device)
         
         # 모델 가중치 로드
-        model_state = checkpoint.get("model_state", checkpoint)
+        # Developer log: checkpoint 구조 확인 및 model_state 추출
+        if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+            model_state = checkpoint["model_state"]
+        elif isinstance(checkpoint, dict):
+            # checkpoint 자체가 state_dict인 경우
+            model_state = checkpoint
+        else:
+            # checkpoint가 state_dict인 경우
+            model_state = checkpoint
         
         # Developer log: RPN decoder는 학습 시에만 사용되며 inference에는 불필요
         # 제출용 Model 클래스에서는 RPN decoder가 없으므로 관련 키를 필터링
-        if isinstance(model_state, dict):
-            # RPN 관련 키 제거 (rpn_decoder, rpn_embed, rpn_out, rpn_value_out)
-            filtered_state = {
-                k: v for k, v in model_state.items()
-                if not k.startswith("rpn_")
-            }
-            # 필터링된 키 수 확인
-            removed_keys = set(model_state.keys()) - set(filtered_state.keys())
-            if removed_keys:
-                print(f"⚠️ Removed {len(removed_keys)} RPN-related keys from checkpoint (inference에 불필요)")
-        else:
-            filtered_state = model_state
+        if not isinstance(model_state, dict):
+            raise ValueError(f"model_state must be a dict, got {type(model_state)}")
+        
+        # RPN 관련 키 제거 (rpn_decoder, rpn_embed, rpn_out, rpn_value_out)
+        filtered_state = {
+            k: v for k, v in model_state.items()
+            if not k.startswith("rpn_")
+        }
+        
+        # 필터링된 키 수 확인
+        removed_keys = set(model_state.keys()) - set(filtered_state.keys())
+        if removed_keys:
+            print(f"⚠️ Removed {len(removed_keys)} RPN-related keys from checkpoint (inference에 불필요)")
+            # 디버깅: 처음 5개 키만 출력
+            sample_keys = list(removed_keys)[:5]
+            print(f"   Sample removed keys: {sample_keys}")
         
         # strict=False로 설정하여 예상치 못한 키 무시 (방어적 처리)
-        missing_keys, unexpected_keys = self.model.load_state_dict(filtered_state, strict=False)
-        
-        if missing_keys:
-            print(f"⚠️ Missing keys in model (will use random init): {len(missing_keys)} keys")
-        if unexpected_keys:
-            print(f"⚠️ Unexpected keys in checkpoint (ignored): {len(unexpected_keys)} keys")
+        try:
+            missing_keys, unexpected_keys = self.model.load_state_dict(filtered_state, strict=False)
+            
+            if missing_keys:
+                print(f"⚠️ Missing keys in model (will use random init): {len(missing_keys)} keys")
+                if len(missing_keys) <= 5:
+                    print(f"   Missing keys: {missing_keys}")
+            if unexpected_keys:
+                print(f"⚠️ Unexpected keys in checkpoint (ignored): {len(unexpected_keys)} keys")
+                if len(unexpected_keys) <= 5:
+                    print(f"   Unexpected keys: {unexpected_keys}")
+        except Exception as e:
+            # 디버깅: 오류 발생 시 상세 정보 출력
+            print(f"❌ Error loading state_dict: {e}")
+            print(f"   Model state dict keys (first 10): {list(self.model.state_dict().keys())[:10]}")
+            print(f"   Checkpoint keys (first 10): {list(filtered_state.keys())[:10]}")
+            raise
         
         # 최대 생성 길이 설정
         self.max_len = 50
