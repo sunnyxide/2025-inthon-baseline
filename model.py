@@ -841,10 +841,13 @@ class Model(BaseModel):
         # 체크포인트 경로 (반드시 상대 경로 사용)
         CKPT_PATH = "best_model.pt"
         
+        print(f"📂 Loading checkpoint from: {CKPT_PATH}")
+        
         # 체크포인트 로드
         # 체크포인트는 dict 형식일 수 있으며, "model_state" 키가 있으면 사용,
         # 없으면 전체를 state_dict로 간주
         checkpoint = torch.load(CKPT_PATH, map_location=self.device)
+        print(f"✅ Checkpoint loaded successfully")
         
         # 토크나이저 설정 로드 (체크포인트에 저장된 설정 필수)
         # tokenizer_config가 별도로 저장된 형식만 지원
@@ -898,19 +901,25 @@ class Model(BaseModel):
         
         # 모델 가중치 로드
         # Developer log: checkpoint 구조 확인 및 model_state 추출
+        print("🔍 Loading model state dict...")
         if isinstance(checkpoint, dict) and "model_state" in checkpoint:
             model_state = checkpoint["model_state"]
+            print(f"   Found 'model_state' key in checkpoint")
         elif isinstance(checkpoint, dict):
             # checkpoint 자체가 state_dict인 경우
             model_state = checkpoint
+            print(f"   Checkpoint is state_dict itself")
         else:
             # checkpoint가 state_dict인 경우
             model_state = checkpoint
+            print(f"   Checkpoint is not a dict, using as-is")
         
         # Developer log: RPN decoder는 학습 시에만 사용되며 inference에는 불필요
         # 제출용 Model 클래스에서는 RPN decoder가 없으므로 관련 키를 필터링
         if not isinstance(model_state, dict):
             raise ValueError(f"model_state must be a dict, got {type(model_state)}")
+        
+        print(f"   Total keys in checkpoint: {len(model_state)}")
         
         # RPN 관련 키 제거 (rpn_decoder, rpn_embed, rpn_out, rpn_value_out)
         filtered_state = {
@@ -920,6 +929,7 @@ class Model(BaseModel):
         
         # 필터링된 키 수 확인
         removed_keys = set(model_state.keys()) - set(filtered_state.keys())
+        print(f"   Keys after filtering: {len(filtered_state)}")
         if removed_keys:
             print(f"⚠️ Removed {len(removed_keys)} RPN-related keys from checkpoint (inference에 불필요)")
             # 디버깅: 처음 5개 키만 출력
@@ -927,8 +937,10 @@ class Model(BaseModel):
             print(f"   Sample removed keys: {sample_keys}")
         
         # strict=False로 설정하여 예상치 못한 키 무시 (방어적 처리)
+        print(f"   Loading state_dict with strict=False...")
         try:
             missing_keys, unexpected_keys = self.model.load_state_dict(filtered_state, strict=False)
+            print(f"✅ State dict loaded successfully")
             
             if missing_keys:
                 print(f"⚠️ Missing keys in model (will use random init): {len(missing_keys)} keys")
@@ -941,8 +953,15 @@ class Model(BaseModel):
         except Exception as e:
             # 디버깅: 오류 발생 시 상세 정보 출력
             print(f"❌ Error loading state_dict: {e}")
+            print(f"   Error type: {type(e).__name__}")
             print(f"   Model state dict keys (first 10): {list(self.model.state_dict().keys())[:10]}")
-            print(f"   Checkpoint keys (first 10): {list(filtered_state.keys())[:10]}")
+            print(f"   Filtered checkpoint keys (first 10): {list(filtered_state.keys())[:10]}")
+            print(f"   Filtered checkpoint keys (last 10): {list(filtered_state.keys())[-10:]}")
+            # RPN 키가 여전히 있는지 확인
+            rpn_keys_in_filtered = [k for k in filtered_state.keys() if k.startswith("rpn_")]
+            if rpn_keys_in_filtered:
+                print(f"   ⚠️ WARNING: RPN keys still present in filtered_state: {len(rpn_keys_in_filtered)}")
+                print(f"   Sample: {rpn_keys_in_filtered[:5]}")
             raise
         
         # 최대 생성 길이 설정
