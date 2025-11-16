@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 
+from operator import truediv
 from typing import List, Any, Tuple, Optional
 
 from config import (
@@ -33,6 +34,34 @@ from dataloader import (
 )
 
 from do_not_edit.metric import compute_metrics  # EM, TES 같은 간단한 성능 지표
+
+# Developer log: Clean checkpoint 자동 생성용
+try:
+    from clean_checkpoint import clean_checkpoint
+    CLEAN_CHECKPOINT_AVAILABLE = True
+except ImportError:
+    CLEAN_CHECKPOINT_AVAILABLE = False
+    # Fallback: 직접 구현
+    def clean_checkpoint(input_path: str, output_path: str | None = None, keep_config: bool = True):
+        """Fallback clean checkpoint function"""
+        checkpoint = torch.load(input_path, map_location="cpu")
+        model_state = checkpoint.get("model_state", checkpoint)
+        clean_state = {k: v for k, v in model_state.items() if not k.startswith("rpn_")}
+        clean_ckpt = {"model_state": clean_state}
+        if keep_config:
+            if "tokenizer_config" in checkpoint:
+                clean_ckpt["tokenizer_config"] = checkpoint["tokenizer_config"]
+            if "model_config" in checkpoint:
+                model_config = checkpoint["model_config"].copy()
+                if "rpn_vocab" in model_config:
+                    model_config.pop("rpn_vocab")
+                clean_ckpt["model_config"] = model_config
+        if output_path is None:
+            from pathlib import Path
+            input_path_obj = Path(input_path)
+            output_path = str(input_path_obj.parent / f"{input_path_obj.stem}_clean{input_path_obj.suffix}")
+        torch.save(clean_ckpt, output_path)
+        print(f"✅ Clean checkpoint created: {output_path}")
 
 from model import (
 
@@ -933,6 +962,17 @@ def train_loop(
                             }
                             torch.save(ckpt, train_config.save_best_path)
                             pbar.write(f"New best EM={best_em:.3f} at step {step}; saved to {train_config.save_best_path}")
+                            
+                            # Developer log: Clean checkpoint 자동 생성 (RPN 키 오류 방지)
+                            # Clean checkpoint는 inference 전용으로 RPN 파라미터 제거
+                            try:
+                                from pathlib import Path
+                                input_path_obj = Path(train_config.save_best_path)
+                                clean_path = str(input_path_obj.parent / f"{input_path_obj.stem}_clean{input_path_obj.suffix}")
+                                clean_checkpoint(train_config.save_best_path, clean_path, keep_config=True)
+                                pbar.write(f"✅ Clean checkpoint created: {clean_path} (for inference)")
+                            except Exception as e:
+                                pbar.write(f"⚠️  Failed to create clean checkpoint: {e}")
 
                     # Early stopping 체크 (wandb sweep용)
                     should_stop = False
@@ -1507,6 +1547,17 @@ def main():
     torch.save(model.state_dict(), "model.pt")
 
     print("Saved model.pt")
+    
+    # Developer log: 학습 완료 후 clean checkpoint 자동 생성 (RPN 키 오류 방지)
+    if train_config.save_best_path is not None and os.path.exists(train_config.save_best_path):
+        try:
+            from pathlib import Path
+            input_path_obj = Path(train_config.save_best_path)
+            clean_path = str(input_path_obj.parent / f"{input_path_obj.stem}_clean{input_path_obj.suffix}")
+            clean_checkpoint(train_config.save_best_path, clean_path, keep_config=True)
+            print(f"✅ Clean checkpoint created: {clean_path} (for inference)")
+        except Exception as e:
+            print(f"⚠️  Failed to create clean checkpoint: {e}")
 
 def train_run():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1664,13 +1715,24 @@ def train_run():
 
         torch.save(model.state_dict(), "model_last.pt")
         print("Saved model_last.pt for run:", run_name)
+        
+        # Developer log: 학습 완료 후 clean checkpoint 자동 생성 (RPN 키 오류 방지)
+        if train_config.save_best_path is not None and os.path.exists(train_config.save_best_path):
+            try:
+                from pathlib import Path
+                input_path_obj = Path(train_config.save_best_path)
+                clean_path = str(input_path_obj.parent / f"{input_path_obj.stem}_clean{input_path_obj.suffix}")
+                clean_checkpoint(train_config.save_best_path, clean_path, keep_config=True)
+                print(f"✅ Clean checkpoint created: {clean_path} (for inference)")
+            except Exception as e:
+                print(f"⚠️  Failed to create clean checkpoint: {e}")
 
 # python train.py로 실행했을 때만 main()을 돌게 합니다.
 
 if __name__ == "__main__":
-    # 단일 실행 (main 함수 사용)
-    # main()
+    # 단일 실행 (main 함수 사용) - 기존 최적 파라미터로 학습
+    main()
 
-    # Sweep 실행 (하이퍼파라미터 탐색)
-    sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
-    wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)
+    # Sweep 실행 (하이퍼파라미터 탐색) - 시간이 없어서 주석 처리
+    # sweep_id = wandb.sweep(sweep_config, project="inthon-2025-arithmetic")
+    # wandb.agent(sweep_id, function=train_run, count=20)  # 20번 실험 (원하는 만큼 조정)
