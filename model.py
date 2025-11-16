@@ -832,11 +832,6 @@ class Model(BaseModel):
         
         체크포인트를 로드하고 모델을 평가 모드로 설정합니다.
         모든 초기화는 이 메서드에서 완료되어야 합니다.
-        
-        Developer log:
-        - Clean checkpoint (RPN parameters removed) should be used for inference
-        - Use clean_checkpoint.py to create clean checkpoint from trained model
-        - This allows strict=True loading without RPN key conflicts
         """
         super().__init__()
         
@@ -844,15 +839,18 @@ class Model(BaseModel):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 체크포인트 경로 (반드시 상대 경로 사용)
-        # Developer log: Clean checkpoint (best_model_clean.pt) is preferred
-        # If clean checkpoint exists, use it; otherwise fall back to best_model.pt
-        import os
-        CKPT_PATH = "best_model_clean.pt" if os.path.exists("best_model_clean.pt") else "best_model.pt"
+        CKPT_PATH = "best_model.pt"
+        
+        print(f"📂 Loading checkpoint from: {CKPT_PATH}")
         
         # 체크포인트 로드
+        # 체크포인트는 dict 형식일 수 있으며, "model_state" 키가 있으면 사용,
+        # 없으면 전체를 state_dict로 간주
         checkpoint = torch.load(CKPT_PATH, map_location=self.device)
+        print(f"✅ Checkpoint loaded successfully")
         
         # 토크나이저 설정 로드 (체크포인트에 저장된 설정 필수)
+        # tokenizer_config가 별도로 저장된 형식만 지원
         tokenizer_config_dict = checkpoint.get("tokenizer_config")
         if tokenizer_config_dict is None:
             raise ValueError(f"체크포인트에 'tokenizer_config'가 없습니다.")
@@ -874,52 +872,66 @@ class Model(BaseModel):
         )
         
         # 모델 설정 로드 (체크포인트에 저장된 설정 필수)
+        # model_config가 별도로 저장된 형식만 지원
         model_config_dict = checkpoint.get("model_config")
         if model_config_dict is None:
             raise ValueError(f"체크포인트에 'model_config'가 없습니다.")
         
         # Developer log: 제출용 Model 클래스에서는 RPN decoder를 사용하지 않음
-        # Clean checkpoint should not have rpn_vocab, but we remove it for safety
-        model_config_dict = model_config_dict.copy()
+        # model_config_dict에서 rpn_vocab을 제거하여 RPN decoder가 생성되지 않도록 함
+        model_config_dict = model_config_dict.copy()  # 원본 수정 방지
         if "rpn_vocab" in model_config_dict:
             model_config_dict.pop("rpn_vocab")
         
-        # Transformer 모델 인스턴스 생성
+        # TinySeq2Seq 모델 인스턴스 생성 (체크포인트에서 로드한 설정을 **kwargs로 전달)
+        # self.model = TinySeq2Seq(
+        #     in_vocab=self.input_tokenizer.vocab_size,  # 입력 vocab 크기
+        #     out_vocab=self.output_tokenizer.vocab_size,  # 출력 vocab 크기
+        #     **model_config_dict,  # 모델 설정을 **kwargs로 전달
+        # ).to(self.device)  # 지정된 디바이스로 이동
+
+        #Transformer 모델 인스턴스
         # Developer log: rpn_vocab=None으로 명시하여 RPN decoder 미생성 보장
         self.model = TransformerSeq2Seq(
-            in_vocab=self.input_tokenizer.vocab_size,
-            out_vocab=self.output_tokenizer.vocab_size,
-            rpn_vocab=None,  # 제출용: RPN decoder 사용 안 함
-            **model_config_dict,
+        in_vocab=self.input_tokenizer.vocab_size,
+        out_vocab=self.output_tokenizer.vocab_size,
+        rpn_vocab=None,  # 제출용: RPN decoder 사용 안 함
+        **model_config_dict,
         ).to(self.device)
         
-        # 모델 가중치 로드
-        # Developer log: Always filter RPN keys to ensure compatibility
+        # 모델 가중치 로드 (RPN head mismatch 등 안전 처리)
+        # Developer log: checkpoint에서 model_state 추출, 없으면 checkpoint 자체를 state_dict로 사용
         model_state = checkpoint.get("model_state", checkpoint)
+        
+        # Developer log: RPN decoder는 학습 시에만 사용되며 inference에는 불필요
+        # 제출용 Model 클래스에서는 RPN decoder가 없으므로 관련 키를 필터링
         if not isinstance(model_state, dict):
             raise ValueError(f"model_state must be a dict, got {type(model_state)}")
         
-        # Always filter RPN keys (defensive approach)
-        # This ensures compatibility even if clean checkpoint was not created
-        original_keys = len(model_state)
-        rpn_keys = [k for k in model_state.keys() if k.startswith("rpn_")]
+        # RPN 관련 키 제거 (rpn_decoder, rpn_embed, rpn_out, rpn_value_out)
+        filtered_state = {
+            k: v for k, v in model_state.items()
+            if not k.startswith("rpn_")
+        }
         
-        if rpn_keys:
-            # Filter RPN keys
-            print(f"⚠️ Warning: Found {len(rpn_keys)} RPN keys in checkpoint, filtering them...")
-            print(f"   Tip: Use 'python clean_checkpoint.py best_model.pt' to create clean checkpoint")
-            model_state = {k: v for k, v in model_state.items() if not k.startswith("rpn_")}
-            filtered_keys = len(model_state)
-            print(f"   Filtered: {original_keys} -> {filtered_keys} keys")
+        # 필터링된 키 수 확인 및 디버깅 출력
+        removed_keys = set(model_state.keys()) - set(filtered_state.keys())
+        if removed_keys:
+            print(f"⚠️ Removed {len(removed_keys)} RPN-related keys from checkpoint (inference에 불필요)")
         
-        # Always use strict=False when filtering (safe approach)
-        # If no RPN keys were found, strict=True would work, but strict=False is safer
-        missing_keys, unexpected_keys = self.model.load_state_dict(model_state, strict=False)
+        # strict=False로 로드 → 불일치 key는 자동 무시
+        # Developer log: strict=False를 사용하여 RPN decoder 키가 checkpoint에 있어도 안전하게 로드
+        # 향후 훈련에서 encoder/decoder depth 변경해도 안전, vocab 사이즈·임베딩 변경해도 안전
+        missing_keys, unexpected_keys = self.model.load_state_dict(
+            filtered_state,
+            strict=False
+        )
         
+        # 디버깅 용도 출력 (원하면 삭제 가능)
         if missing_keys:
-            print(f"⚠️ Warning: {len(missing_keys)} missing keys (using random init)")
+            print(f"[Model Load Notice] Missing keys: {missing_keys}")
         if unexpected_keys:
-            print(f"⚠️ Warning: {len(unexpected_keys)} unexpected keys (ignored)")
+            print(f"[Model Load Notice] Unexpected keys: {unexpected_keys}")
         
         # 최대 생성 길이 설정
         self.max_len = 50
