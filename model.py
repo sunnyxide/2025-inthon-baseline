@@ -874,6 +874,12 @@ class Model(BaseModel):
         if model_config_dict is None:
             raise ValueError(f"체크포인트에 'model_config'가 없습니다.")
         
+        # Developer log: 제출용 Model 클래스에서는 RPN decoder를 사용하지 않음
+        # model_config_dict에서 rpn_vocab을 제거하여 RPN decoder가 생성되지 않도록 함
+        model_config_dict = model_config_dict.copy()  # 원본 수정 방지
+        if "rpn_vocab" in model_config_dict:
+            model_config_dict.pop("rpn_vocab")
+        
         # TinySeq2Seq 모델 인스턴스 생성 (체크포인트에서 로드한 설정을 **kwargs로 전달)
         # self.model = TinySeq2Seq(
         #     in_vocab=self.input_tokenizer.vocab_size,  # 입력 vocab 크기
@@ -882,15 +888,39 @@ class Model(BaseModel):
         # ).to(self.device)  # 지정된 디바이스로 이동
 
         #Transformer 모델 인스턴스
+        # Developer log: rpn_vocab=None으로 명시하여 RPN decoder 미생성 보장
         self.model = TransformerSeq2Seq(
         in_vocab=self.input_tokenizer.vocab_size,
         out_vocab=self.output_tokenizer.vocab_size,
+        rpn_vocab=None,  # 제출용: RPN decoder 사용 안 함
         **model_config_dict,
         ).to(self.device)
         
         # 모델 가중치 로드
         model_state = checkpoint.get("model_state", checkpoint)
-        self.model.load_state_dict(model_state)
+        
+        # Developer log: RPN decoder는 학습 시에만 사용되며 inference에는 불필요
+        # 제출용 Model 클래스에서는 RPN decoder가 없으므로 관련 키를 필터링
+        if isinstance(model_state, dict):
+            # RPN 관련 키 제거 (rpn_decoder, rpn_embed, rpn_out, rpn_value_out)
+            filtered_state = {
+                k: v for k, v in model_state.items()
+                if not k.startswith("rpn_")
+            }
+            # 필터링된 키 수 확인
+            removed_keys = set(model_state.keys()) - set(filtered_state.keys())
+            if removed_keys:
+                print(f"⚠️ Removed {len(removed_keys)} RPN-related keys from checkpoint (inference에 불필요)")
+        else:
+            filtered_state = model_state
+        
+        # strict=False로 설정하여 예상치 못한 키 무시 (방어적 처리)
+        missing_keys, unexpected_keys = self.model.load_state_dict(filtered_state, strict=False)
+        
+        if missing_keys:
+            print(f"⚠️ Missing keys in model (will use random init): {len(missing_keys)} keys")
+        if unexpected_keys:
+            print(f"⚠️ Unexpected keys in checkpoint (ignored): {len(unexpected_keys)} keys")
         
         # 최대 생성 길이 설정
         self.max_len = 50
