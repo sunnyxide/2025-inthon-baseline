@@ -1380,11 +1380,18 @@ def main():
     print(f"  lambda_rpn: {train_config.lambda_rpn}")
     print()
 
+    # Developer log: input_chars를 모델에 전달하여 토큰 타입 임베딩 및 연산자 추출에 사용
+    model_kwargs = model_config.__dict__.copy()
+    # input_tokenizer의 vocab 리스트를 input_chars로 전달
+    # tokenizer의 stoi를 역으로 사용하여 문자 리스트 생성
+    input_chars_list = [input_tokenizer.itos[i] for i in range(input_tokenizer.vocab_size)]
+    model_kwargs["input_chars"] = input_chars_list
+    
     model = TransformerSeq2Seq(
         in_vocab=input_tokenizer.vocab_size,
         out_vocab=output_tokenizer.vocab_size,
         rpn_vocab=rpn_vocab,
-        **model_config.__dict__,
+        **model_kwargs,
     )
     
     # Verify RPN head was initialized correctly
@@ -1693,11 +1700,17 @@ def train_run():
             else None
         )
 
+        # Developer log: input_chars를 모델에 전달하여 토큰 타입 임베딩 및 연산자 추출에 사용
+        model_kwargs = model_config.__dict__.copy()
+        # input_tokenizer의 vocab 리스트를 input_chars로 전달
+        input_chars_list = [input_tokenizer.itos[i] for i in range(input_tokenizer.vocab_size)]
+        model_kwargs["input_chars"] = input_chars_list
+        
         model = TransformerSeq2Seq(
             in_vocab=input_tokenizer.vocab_size,
             out_vocab=output_tokenizer.vocab_size,
             rpn_vocab=rpn_vocab,
-            **model_config.__dict__,
+            **model_kwargs,
         )
 
         train_loop(

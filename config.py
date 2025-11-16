@@ -21,6 +21,9 @@ class ModelConfig:
     dim_feedforward: int = 1024  # FFN dimension (유지)
     dropout: float = 0.0  # Dropout (유지: 과적합 없음)
     use_digit_conv: bool = False  # Optional 1D conv layer for digit-wise carry modeling
+    use_right_aligned_pos: bool = True  # Developer log: 오른쪽 정렬 위치 인코딩으로 digit-wise 알고리즘 강화
+    use_token_type_emb: bool = True  # Developer log: 토큰 타입 임베딩으로 구조적 계산 inductive bias 제공
+    use_operator_head: bool = True  # Developer log: 연산자별 출력 헤드로 operator-specific circuits 구현
     # 독립변수 테스트: RPN 유효성 검증을 위해 레이어는 baseline 유지
 
 DEPTH_PROFILES = {

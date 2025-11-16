@@ -407,6 +407,206 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class RightAlignedPositionalEncoding(nn.Module):
+    """
+    오른쪽 정렬 기준 위치 인코딩 (digit-wise 알고리즘에 유리).
+    Developer log: 산술 알고리즘은 least significant digit부터 처리하므로,
+    오른쪽에서 왼쪽으로의 위치 정보를 제공하여 carry 계산을 용이하게 함.
+    입력: [B, T, d_model]
+    출력: [B, T, d_model] (오른쪽 기준 위치 인코딩이 더해진 결과)
+    """
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        pe = torch.zeros(max_len, d_model)  # [T, d_model]
+        # 오른쪽에서 왼쪽으로의 거리 (0 = 가장 오른쪽)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [T, 1]
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)   # 짝수 차원
+        pe[:, 1::2] = torch.cos(position * div_term)   # 홀수 차원
+        pe = pe.unsqueeze(0)  # [1, T, d_model]
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, T, d_model]
+        """
+        B, T, _ = x.size()
+        # 시퀀스를 뒤집어서 오른쪽 기준 위치 인코딩 적용
+        # [B, T, d_model] -> [B, T, d_model] (flipped)
+        x_flipped = torch.flip(x, dims=[1])  # 시간 축 기준 뒤집기
+        x_flipped = x_flipped + self.pe[:, :T, :]
+        x_flipped = self.dropout(x_flipped)
+        # 다시 뒤집어서 원래 순서로 복원
+        x = torch.flip(x_flipped, dims=[1])
+        return x
+
+
+def _extract_operator_from_tokens(token_ids: torch.Tensor, itos: Dict[int, str]) -> torch.Tensor:
+    """
+    토큰 시퀀스에서 주요 연산자를 추출.
+    Developer log: 여러 연산자가 있을 경우 가장 우선순위가 높은 연산자를 반환.
+    연산자 우선순위: * > // > + > -
+    
+    Args:
+        token_ids: [B, S] 입력 토큰 ID
+        itos: 토큰 ID -> 문자 매핑 딕셔너리
+    Returns:
+        [B] 연산자 ID 텐서 (0: '+', 1: '-', 2: '*', 3: '//', 0: default)
+    """
+    B, S = token_ids.size()
+    device = token_ids.device
+    op_ids = torch.zeros(B, dtype=torch.long, device=device)
+    
+    # 연산자 우선순위: * > // > + > -
+    op_priority = {'*': 3, '//': 2, '+': 1, '-': 0}
+    
+    for b in range(B):
+        max_priority = -1
+        found_op = 0  # default: '+'
+        
+        # '//' 처리를 위한 플래그
+        prev_slash = False
+        
+        for s in range(S):
+            token_id = token_ids[b, s].item()
+            char = itos.get(token_id, '')
+            
+            if prev_slash and char == '/':
+                # '//' 연산자 발견
+                if op_priority.get('//', -1) > max_priority:
+                    max_priority = op_priority['//']
+                    found_op = 3  # '//'
+                prev_slash = False
+            elif char == '/':
+                prev_slash = True
+            elif char in op_priority:
+                prev_slash = False
+                priority = op_priority[char]
+                if priority > max_priority:
+                    max_priority = priority
+                    if char == '*':
+                        found_op = 2
+                    elif char == '+':
+                        found_op = 0
+                    elif char == '-':
+                        found_op = 1
+            else:
+                prev_slash = False
+        
+        op_ids[b] = found_op
+    
+    return op_ids
+
+
+class TokenTypeEmbedding(nn.Module):
+    """
+    토큰 타입 임베딩 (digit / operator / parenthesis 역할 구분).
+    Developer log: 숫자, 연산자, 괄호를 구분하여 구조적 계산에 유리한 inductive bias 제공.
+    """
+    def __init__(self, d_model: int, num_types: int = 3):
+        """
+        Args:
+            d_model: 임베딩 차원
+            num_types: 토큰 타입 수 (0: digit, 1: operator, 2: parenthesis)
+        """
+        super().__init__()
+        self.embedding = nn.Embedding(num_types, d_model)
+        self.num_types = num_types
+
+    def forward(self, token_ids: torch.Tensor, itos: Dict[int, str]) -> torch.Tensor:
+        """
+        Args:
+            token_ids: [B, T] 토큰 ID 텐서
+            itos: 토큰 ID -> 문자 매핑 딕셔너리
+        Returns:
+            [B, T, d_model] 타입 임베딩
+        """
+        B, T = token_ids.size()
+        device = token_ids.device
+        
+        type_ids = torch.zeros((B, T), dtype=torch.long, device=device)
+        
+        # '//' 처리를 위한 플래그
+        prev_slash = torch.zeros(B, dtype=torch.bool, device=device)
+        
+        for t in range(T):
+            for b in range(B):
+                token_id = token_ids[b, t].item()
+                char = itos.get(token_id, '')
+                
+                if prev_slash[b] and char == '/':
+                    # '//' 연산자 완성
+                    type_ids[b, t] = 1  # operator
+                    prev_slash[b] = False
+                elif char == '/':
+                    prev_slash[b] = True
+                    type_ids[b, t] = 1  # operator
+                elif char.isdigit():
+                    type_ids[b, t] = 0  # digit
+                    prev_slash[b] = False
+                elif char in "+-*":
+                    type_ids[b, t] = 1  # operator
+                    prev_slash[b] = False
+                elif char in "()":
+                    type_ids[b, t] = 2  # parenthesis
+                    prev_slash[b] = False
+                else:
+                    type_ids[b, t] = 0  # default: digit
+                    prev_slash[b] = False
+        
+        return self.embedding(type_ids)  # [B, T, d_model]
+
+
+class OperatorHead(nn.Module):
+    """
+    연산자별 출력 헤드 (operator-specific circuits).
+    Developer log: 각 연산자(+, -, *, //)에 특화된 출력 레이어로
+    휴리스틱 간섭을 줄이고 연산자별 회로를 분리.
+    """
+    def __init__(self, d_model: int, vocab_size: int, num_ops: int = 4):
+        """
+        Args:
+            d_model: 입력 차원
+            vocab_size: 출력 vocab 크기
+            num_ops: 연산자 수 (4: +, -, *, //)
+        """
+        super().__init__()
+        self.proj = nn.ModuleList([
+            nn.Linear(d_model, vocab_size) for _ in range(num_ops)
+        ])
+        self.num_ops = num_ops
+
+    def forward(self, h: torch.Tensor, op_id: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: [B, T, d_model] 또는 [B, d_model] hidden state
+            op_id: [B] 또는 [B, T] 연산자 ID (0: '+', 1: '-', 2: '*', 3: '//')
+        Returns:
+            [B, T, vocab_size] 또는 [B, vocab_size] logits
+        """
+        if h.dim() == 2:  # [B, d_model]
+            B = h.size(0)
+            logits_list = []
+            for b in range(B):
+                op = op_id[b].item() if op_id.dim() == 1 else op_id[b, 0].item()
+                op = max(0, min(self.num_ops - 1, op))  # 범위 체크
+                logits_list.append(self.proj[op](h[b:b+1]))
+            return torch.cat(logits_list, dim=0)
+        else:  # [B, T, d_model]
+            B, T, _ = h.size()
+            logits_list = []
+            for t in range(T):
+                if op_id.dim() == 1:  # [B] - 모든 타임스텝에 동일한 op_id 사용
+                    op = op_id[0].item()
+                else:  # [B, T]
+                    op = op_id[0, t].item()
+                op = max(0, min(self.num_ops - 1, op))  # 범위 체크
+                logits_list.append(self.proj[op](h[:, t:t+1, :]))
+            return torch.cat(logits_list, dim=1)  # [B, T, vocab_size]
+
+
 def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
     """
     디코더용 causal mask (각 위치가 이전 토큰까지만 볼 수 있도록).
@@ -442,19 +642,37 @@ class TransformerSeq2Seq(nn.Module):
         dropout = kwargs.get("dropout", 0.1)
         rpn_vocab = kwargs.get("rpn_vocab")
         use_digit_conv = kwargs.get("use_digit_conv", False)
+        use_right_aligned_pos = kwargs.get("use_right_aligned_pos", False)
+        use_token_type_emb = kwargs.get("use_token_type_emb", False)
+        use_operator_head = kwargs.get("use_operator_head", False)
         self.d_model = d_model
         self.in_vocab = in_vocab
         self.out_vocab = out_vocab
         self.rpn_vocab = rpn_vocab
         self.use_digit_conv = use_digit_conv
+        self.use_right_aligned_pos = use_right_aligned_pos
+        self.use_token_type_emb = use_token_type_emb
+        self.use_operator_head = use_operator_head
 
         # 임베딩
         self.embed_in = nn.Embedding(in_vocab, d_model)
         self.embed_out = nn.Embedding(out_vocab, d_model)
 
-        # 위치 인코딩
-        self.pos_enc_in = PositionalEncoding(d_model, dropout)
-        self.pos_enc_out = PositionalEncoding(d_model, dropout)
+        # 위치 인코딩 (오른쪽 정렬 또는 표준)
+        if use_right_aligned_pos:
+            # Developer log: 오른쪽 정렬 위치 인코딩으로 digit-wise 알고리즘 강화
+            self.pos_enc_in = RightAlignedPositionalEncoding(d_model, dropout)
+            self.pos_enc_out = RightAlignedPositionalEncoding(d_model, dropout)
+        else:
+            self.pos_enc_in = PositionalEncoding(d_model, dropout)
+            self.pos_enc_out = PositionalEncoding(d_model, dropout)
+        
+        # 토큰 타입 임베딩 (선택적)
+        if use_token_type_emb:
+            # Developer log: 토큰 타입 임베딩으로 구조적 계산 inductive bias 제공
+            self.token_type_emb = TokenTypeEmbedding(d_model, num_types=3)
+        else:
+            self.token_type_emb = None
 
         # 인코더 / 디코더 레이어 정의 (batch_first=True로 [B, T, C] 사용)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -475,8 +693,29 @@ class TransformerSeq2Seq(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
-        # 출력 projection
-        self.out_proj = nn.Linear(d_model, out_vocab)
+        # 출력 projection (연산자별 헤드 또는 표준)
+        if use_operator_head:
+            # Developer log: 연산자별 출력 헤드로 operator-specific circuits 구현
+            self.operator_head = OperatorHead(d_model, out_vocab, num_ops=4)
+            self.out_proj = None  # operator_head 사용 시 비활성화
+        else:
+            self.operator_head = None
+            self.out_proj = nn.Linear(d_model, out_vocab)
+        
+        # 입력 문자 집합 저장 (토큰 타입 임베딩 및 연산자 추출용)
+        # Developer log: tokenizer의 itos를 사용하기 위해 input_chars 저장
+        # 특수 토큰(PAD, BOS, EOS)이 있을 수 있으므로 이를 고려
+        input_chars_list = kwargs.get("input_chars", INPUT_CHARS)
+        if isinstance(input_chars_list, list):
+            # 특수 토큰이 앞에 있을 수 있음 (PAD, BOS, EOS 순서)
+            # 실제 문자는 특수 토큰 이후부터 시작
+            special_tokens = [PAD, BOS, EOS]
+            self.input_chars = input_chars_list
+            # itos 매핑 생성 (토큰 ID -> 문자)
+            self.itos = {i: ch for i, ch in enumerate(self.input_chars)}
+        else:
+            self.input_chars = INPUT_CHARS
+            self.itos = {i: ch for i, ch in enumerate([PAD, BOS, EOS] + INPUT_CHARS)}
 
         # Digit-level 1D convolution module (선택적 자리올림 패턴 보강용)
         if self.use_digit_conv:
@@ -524,6 +763,12 @@ class TransformerSeq2Seq(nn.Module):
 
         # --- Encoder ---
         src_emb = self.embed_in(src) * math.sqrt(self.d_model)  # [B, S, d_model]
+        
+        # 토큰 타입 임베딩 추가 (선택적)
+        if self.use_token_type_emb and self.token_type_emb is not None:
+            type_emb = self.token_type_emb(src, self.itos)  # [B, S, d_model]
+            src_emb = src_emb + type_emb
+        
         src_emb = self.pos_enc_in(src_emb)                      # 위치 인코딩 추가
 
         # 소스 패딩 마스크 (True = 패딩임)
@@ -557,7 +802,14 @@ class TransformerSeq2Seq(nn.Module):
             conv_out = self.digit_conv_activation(conv_out)
             dec_out = conv_out.transpose(1, 2)  # [B, T, C]
 
-        logits = self.out_proj(dec_out)  # [B, T, out_vocab]
+        # 연산자별 헤드 또는 표준 출력 projection
+        if self.use_operator_head and self.operator_head is not None:
+            # 입력에서 주요 연산자 추출
+            op_ids = _extract_operator_from_tokens(src, self.itos)  # [B]
+            logits = self.operator_head(dec_out, op_ids)  # [B, T, out_vocab]
+        else:
+            logits = self.out_proj(dec_out)  # [B, T, out_vocab]
+        
         return logits
 
     def forward_with_rpn(
@@ -582,12 +834,23 @@ class TransformerSeq2Seq(nn.Module):
 
         # --- Encoder ---
         src_emb = self.embed_in(src) * math.sqrt(self.d_model)
+        
+        # 토큰 타입 임베딩 추가 (선택적)
+        if self.use_token_type_emb and self.token_type_emb is not None:
+            type_emb = self.token_type_emb(src, self.itos)  # [B, S, d_model]
+            src_emb = src_emb + type_emb
+        
         src_emb = self.pos_enc_in(src_emb)
         src_key_padding_mask = (src == src_pad_id)
         memory = self.encoder(
             src_emb,
             src_key_padding_mask=src_key_padding_mask,
         )
+
+        # 연산자 ID 추출 (연산자별 헤드 사용 시)
+        op_ids = None
+        if self.use_operator_head and self.operator_head is not None:
+            op_ids = _extract_operator_from_tokens(src, self.itos)  # [B]
 
         # --- Result decoder ---
         res_emb = self.embed_out(tgt_result_inp) * math.sqrt(self.d_model)
@@ -604,7 +867,12 @@ class TransformerSeq2Seq(nn.Module):
             conv_out_res = self.digit_conv(conv_in_res)
             conv_out_res = self.digit_conv_activation(conv_out_res)
             res_out = conv_out_res.transpose(1, 2)
-        result_logits = self.out_proj(res_out)
+        
+        # 연산자별 헤드 또는 표준 출력 projection
+        if self.use_operator_head and self.operator_head is not None and op_ids is not None:
+            result_logits = self.operator_head(res_out, op_ids)  # [B, T_res, out_vocab]
+        else:
+            result_logits = self.out_proj(res_out)
 
         # --- RPN decoder (훈련 전용) ---
         rpn_emb = self.rpn_embed(rpn_inp) * math.sqrt(self.d_model)
@@ -642,12 +910,23 @@ class TransformerSeq2Seq(nn.Module):
 
         # --- Encoder ---
         src_emb = self.embed_in(src) * math.sqrt(self.d_model)    # [B, S, d_model]
+        
+        # 토큰 타입 임베딩 추가 (선택적)
+        if self.use_token_type_emb and self.token_type_emb is not None:
+            type_emb = self.token_type_emb(src, self.itos)  # [B, S, d_model]
+            src_emb = src_emb + type_emb
+        
         src_emb = self.pos_enc_in(src_emb)
         src_key_padding_mask = (src == src_pad_id)                # [B, S]
         memory = self.encoder(
             src_emb,
             src_key_padding_mask=src_key_padding_mask,
         )  # [B, S, d_model]
+
+        # 연산자 ID 추출 (연산자별 헤드 사용 시)
+        op_ids = None
+        if self.use_operator_head and self.operator_head is not None:
+            op_ids = _extract_operator_from_tokens(src, self.itos)  # [B]
 
         # 디코더 입력 시작: BOS
         y = torch.full((B, 1), bos_id, dtype=torch.long, device=device)  # [B, 1]
@@ -675,7 +954,13 @@ class TransformerSeq2Seq(nn.Module):
                 dec_out = conv_out.transpose(1, 2)
 
             last_step = dec_out[:, -1, :]        # [B, d_model]
-            logits = self.out_proj(last_step)    # [B, out_vocab]
+            
+            # 연산자별 헤드 또는 표준 출력 projection
+            if self.use_operator_head and self.operator_head is not None and op_ids is not None:
+                logits = self.operator_head(last_step, op_ids)  # [B, out_vocab]
+            else:
+                logits = self.out_proj(last_step)    # [B, out_vocab]
+            
             next_id = torch.argmax(logits, dim=-1)  # [B]
             outputs.append(next_id)
 
@@ -721,12 +1006,23 @@ class TransformerSeq2Seq(nn.Module):
         
         # --- Encoder (shared across all beams) ---
         src_emb = self.embed_in(src) * math.sqrt(self.d_model)
+        
+        # 토큰 타입 임베딩 추가 (선택적)
+        if self.use_token_type_emb and self.token_type_emb is not None:
+            type_emb = self.token_type_emb(src, self.itos)  # [B, S, d_model]
+            src_emb = src_emb + type_emb
+        
         src_emb = self.pos_enc_in(src_emb)
         src_key_padding_mask = (src == src_pad_id)
         memory = self.encoder(
             src_emb,
             src_key_padding_mask=src_key_padding_mask,
         )  # [B, S, d_model]
+        
+        # 연산자 ID 추출 (연산자별 헤드 사용 시)
+        op_ids = None
+        if self.use_operator_head and self.operator_head is not None:
+            op_ids = _extract_operator_from_tokens(src, self.itos)  # [B]
         
         # For simplicity, process batch_size=1 at a time
         # (Full batched beam search is complex; this is a practical implementation)
@@ -736,6 +1032,7 @@ class TransformerSeq2Seq(nn.Module):
             # Single sample beam search
             memory_b = memory[b:b+1]  # [1, S, d_model]
             src_mask_b = src_key_padding_mask[b:b+1]  # [1, S]
+            op_id_b = op_ids[b:b+1] if op_ids is not None else None
             
             # Initialize beams: [(sequence, score)]
             beams = [(torch.tensor([[bos_id]], device=device, dtype=torch.long), 0.0)]
@@ -769,7 +1066,12 @@ class TransformerSeq2Seq(nn.Module):
                         dec_out = conv_out.transpose(1, 2)
                     
                     last_step = dec_out[:, -1, :]  # [1, d_model]
-                    logits = self.out_proj(last_step)  # [1, out_vocab]
+                    
+                    # 연산자별 헤드 또는 표준 출력 projection
+                    if self.use_operator_head and self.operator_head is not None and op_id_b is not None:
+                        logits = self.operator_head(last_step, op_id_b)  # [1, out_vocab]
+                    else:
+                        logits = self.out_proj(last_step)  # [1, out_vocab]
                     log_probs = torch.log_softmax(logits, dim=-1)  # [1, out_vocab]
                     
                     # Get top-k candidates
@@ -892,11 +1194,16 @@ class Model(BaseModel):
 
         #Transformer 모델 인스턴스
         # Developer log: rpn_vocab=None으로 명시하여 RPN decoder 미생성 보장
+        # input_chars를 모델에 전달하여 토큰 타입 임베딩 및 연산자 추출에 사용
+        model_kwargs = model_config_dict.copy()
+        input_chars_list = [self.input_tokenizer.itos[i] for i in range(self.input_tokenizer.vocab_size)]
+        model_kwargs["input_chars"] = input_chars_list
+        
         self.model = TransformerSeq2Seq(
         in_vocab=self.input_tokenizer.vocab_size,
         out_vocab=self.output_tokenizer.vocab_size,
         rpn_vocab=None,  # 제출용: RPN decoder 사용 안 함
-        **model_config_dict,
+        **model_kwargs,
         ).to(self.device)
         
         # 모델 가중치 로드 (RPN head mismatch 등 안전 처리)
